@@ -84,6 +84,15 @@ template <typename T> T* ppalloc(size_t n) {
     own_dev(p);
     return (T*) p;
 }
+#else
+template <typename T> T* ppalloc(size_t n) {
+    void* p = nullptr;
+    ckc(cudaMalloc(&p, n * sizeof(T)), "prefill: peer device allocation failed");
+    pf_card_bytes += n * sizeof(T);
+    ckc(FNX_ZERO_DEV(p, n * sizeof(T)), "peer buffer clear");
+    own_dev(p);
+    return (T*) p;
+}
 #endif
 
 // a grid of at most 4096 blocks over n values, 256 threads each
@@ -100,11 +109,25 @@ static __global__ void k_f32_f16(const float* __restrict__ x, size_t n, __half* 
 
 constexpr int PF_RING_STEPS = pf_ring_steps(NCARD);   // flags a set holds
 
+// FNX_PF_ERRDBG=1: the first value to fail a range check, kept as one device record the host reads back after the pass
+// (a pair's index, its x bits, its y bits, (the sum's number << 2) | the kernel: 1 pack, 2 out, and the first-hit latch)
+constexpr int PF_ERRDBG_N = 5;
+static __device__ __forceinline__ void pfr_err_note(unsigned* err, unsigned* dbg, unsigned tag, int e, float x, float y) {
+    atomicOr(err, 2u);
+    if (dbg && atomicCAS(dbg + 4, 0u, 1u) == 0u) {
+        dbg[0] = (unsigned) e;
+        dbg[1] = __float_as_uint(x);
+        dbg[2] = __float_as_uint(y);
+        dbg[3] = tag;
+    }
+}
+
 // out = f16(x) over n values (n even)
-static __global__ void k_pfr_pack(const float2* __restrict__ x, int n2, __half2* __restrict__ out, unsigned* err) {
+static __global__ void k_pfr_pack(const float2* __restrict__ x, int n2, __half2* __restrict__ out, unsigned* err,
+                                  unsigned* dbg = nullptr, unsigned tag = 0) {
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
         const float2 v = x[e];
-        if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(err, 2u);   // past fp16's range (or NaN)
+        if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) pfr_err_note(err, dbg, tag, e, v.x, v.y);   // past fp16's range (or NaN)
         out[e] = __floats2half2_rn(v.x, v.y);
     }
 }
@@ -147,7 +170,7 @@ static __global__ void k_pfr_add_gather(const __half2* __restrict__ in, const fl
     if (dst.sysfence) __threadfence_system();
 #endif
 }
-#if FNX_HIP
+#if 1
 // FNX_PF_PEER, small chunks (rows <= p.a2a_rows): the sum in ONE cross-card latency instead of the ring's NCARD hops of copy + flag + wait. Every card stores its f32 addends of the
 // chunk into slot [its number] of every other card's mailbox (device memory of the receiver, fine-grained), the last block to finish its stores raises the flag [its number] on
 // every other card; then every card waits for its NCARD - 1 flags and makes the whole sum itself, row by row in the ring's own order and roundings: part k of the rows
@@ -181,7 +204,11 @@ static __global__ void k_pfa_sum(float* __restrict__ x, int C, const float4* __r
     if (threadIdx.x < NCARD && (int) threadIdx.x != g) {
         const long long t0 = clock64();
         while ((int) (*(volatile const unsigned*) (flag + threadIdx.x) - seq) < 0) {
+            #if FNX_HIP
             __builtin_amdgcn_s_sleep(1);
+#else
+            __nanosleep(64);
+#endif
             if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
         }
     }
@@ -241,10 +268,11 @@ static __global__ void k_pfr_out(const __half2* __restrict__ ag, float2* __restr
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) x[e] = __half22float2(ag[e]);
 }
 // RCCL's fp16 sum back to x as f32, with the range check the host exchange's adds make (a sum past fp16's range, or NaN: error bit 2)
-static __global__ void k_pfr_out_chk(const __half2* __restrict__ ag, float2* __restrict__ x, int n2, unsigned* err) {
+static __global__ void k_pfr_out_chk(const __half2* __restrict__ ag, float2* __restrict__ x, int n2, unsigned* err,
+                                     unsigned* dbg = nullptr, unsigned tag = 0) {
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
         const float2 v = __half22float2(ag[e]);
-        if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(err, 2u);
+        if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) pfr_err_note(err, dbg, tag, e, v.x, v.y);
         x[e] = v;
     }
 }

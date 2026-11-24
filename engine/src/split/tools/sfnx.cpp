@@ -2,7 +2,8 @@
 // only; the server tokenizes, applies the chat template, matches stop strings and parses tools).
 //
 //   sfnx --serve --native MODEL.gguf --mtp RT_DIR --draft-vocab VOCAB.bin [--max-context N] [--spec K] [--lookup K]
-//        [--conversation-cache-mib M] [--batch SLOTS]
+//        [--conversation-cache-mib M] [--conversation-cache-slots K] [--batch SLOTS]
+//        [--l2-gpu N] [--l2-gib G] [--l2-reserve-gib G] [--l2-fill-mib M] [--l2-selftest 0|1]
 //
 // One request alone: GEN <max_new> [key=value ...] <ids>, answered with PP <done> <total> per prompt chunk, RESUME
 // <reused>, T <id> per token (speculative: the draft layer's chain and n-gram lookups, verified a window at a time),
@@ -67,6 +68,7 @@ struct Args {
     std::string draft = "mtp", draft_model;   // --draft mtp|dflash2 (FNX_DRAFT), --draft-model PACK: DFlash2's runtime pack (tools/dflash2_pack.py)
     int max_ctx = 262144, K = 6, lookup = 15, batch = 1;
     long cache_mib = 0;   // checkpoints and parked conversations in host memory (0: none)
+    long cache_slots = 0; // --conversation-cache-slots: how many conversations may be parked at once (0: the budget alone bounds them)
     bool vision = false;  // GENI / BGENI: prompts with images (embeddings from sfnx-vision)
 };
 
@@ -79,6 +81,12 @@ Args parse_args(int argc, char** argv) {
             if (i + 1 >= argc) throw std::runtime_error(k + " needs a value");
             return argv[++i];
         };
+        // a setting the engine reads from the environment: the flag and a variable already set must not disagree
+        auto envarg = [&](const char* var) {
+            const std::string s = val();
+            if (const char* e = std::getenv(var); e && s != e) throw std::runtime_error(k + " " + s + " and " + var + "=" + e + " disagree");
+            ::setenv(var, s.c_str(), 1);
+        };
         if (k == "--serve") serve = true;
         else if (k == "--native") a.gguf = val();
         else if (k == "--mtp") a.mtp_dir = val();
@@ -89,6 +97,7 @@ Args parse_args(int argc, char** argv) {
         else if (k == "--spec") a.K = std::stoi(val());
         else if (k == "--lookup") a.lookup = std::stoi(val());
         else if (k == "--conversation-cache-mib") a.cache_mib = std::stol(val());
+        else if (k == "--conversation-cache-slots") a.cache_slots = std::stol(val());
         else if (k == "--batch") a.batch = std::stoi(val());
         else if (k == "--layer-split") val();   // Strata's layer split; sFNX splits every layer across the cards
         else if (k == "--rope-scale") {   // YaRN for a longer context: the engine reads it as FNX_ROPE_SCALE
@@ -97,6 +106,11 @@ Args parse_args(int argc, char** argv) {
                 throw std::runtime_error("--rope-scale " + s + " and FNX_ROPE_SCALE=" + e + " disagree");
             ::setenv("FNX_ROPE_SCALE", s.c_str(), 1);
         }
+        else if (k == "--l2-gpu") envarg("FNX_L2_GPU");   // the spare card that holds the expert tier (src/l2_offload.hpp)
+        else if (k == "--l2-gib") envarg("FNX_L2_GIB");
+        else if (k == "--l2-reserve-gib") envarg("FNX_L2_RESERVE_GIB");
+        else if (k == "--l2-fill-mib") envarg("FNX_L2_FILL_MIB");
+        else if (k == "--l2-selftest") envarg("FNX_L2_SELFTEST");
         else if (k == "--vision") a.vision = true;
         else throw std::runtime_error("unknown argument " + k);
     }
@@ -444,6 +458,7 @@ struct Server {
     Server(const Args& args, fnx::Model& model, fnx::Engine& eng, Input& input) : a(args), m(model), e(eng), in(input) {
         cache = std::make_shared<fnx::ConvCache>();
         cache->budget = (size_t) a.cache_mib << 20;
+        cache->slots = (size_t) (a.cache_slots > 0 ? a.cache_slots : 0);
         slots.resize((size_t) a.batch);
         slots[0].lane = 0;
         slots[0].sess = std::make_unique<fnx::Session>(e, a.K, a.lookup, EOS, 248045, cache, 0);
@@ -1149,6 +1164,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "sfnx: %d cards builds and passes the CPU checks but has not been validated on hardware "
                                  "(docs/verification.md, \"Other card counts\")\n", fnx::NCARD);
         say("INFO engine=sfnx version=0.2 spec=" + std::to_string(a.K) + " conversation_cache_mib=" + std::to_string(a.cache_mib) +
+            " conversation_cache_slots=" + std::to_string(a.cache_slots) +
             (a.batch > 1 ? " batch_slots=" + std::to_string(a.batch) + " slot_cache=1" : ""));
         say("READY " + std::to_string(a.max_ctx) + " stop");
         std::thread reader([&] { in.run(); });

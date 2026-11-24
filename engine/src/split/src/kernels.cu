@@ -873,6 +873,7 @@ __device__ __forceinline__ float ring_x(const float* x, const RingMoe& m, int T,
     float s = 0.f;
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) s = fmaf(m.topw[t * TOPK + k], m.part[((size_t) t * TOPK + k) * N + i], s);
+    if (m.add) s += m.add[(size_t) t * N + i];   // the rows of the experts a tier card ran (l2_pf.hpp)
     return fmaf(sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]), m.part[((size_t) T * TOPK + t) * N + i], s);
 }
 __device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int T, int t, int p) {
@@ -1813,7 +1814,7 @@ __global__ void k_route_trace(const int* topi, int n, int layer, unsigned* trace
 namespace {
 // the plan alone (cache_plan, moe.cuh), one warp
 __global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list) {
-    cache_plan(jobs, njobs[0], layer, ec, list);
+    cache_plan<1>(jobs, njobs[0], layer, ec, list);
 }
 // the listed experts' matrices (gu_bytes and dn_bytes each, multiples of 16: the layer's) from their host copies to
 // their slots in pool p
@@ -1823,8 +1824,12 @@ __global__ void __launch_bounds__(256) k_cache_copy(ExpertCache ec, int p, const
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < (size_t) n * per; i += (size_t) gridDim.x * blockDim.x) {
         const int k = (int) (i / per);
         const size_t o = i % per;
-        const int g = list[1 + k];
-        char* at = ec.pool[p] + (size_t) (ec.slot_of[g] - ec.s0[p]) * ec.slot_bytes[p];
+        const unsigned int packed = (unsigned int) list[1 + k];
+        const int g = (int) (packed & 0xffffu);
+        const int slot = (int) (packed >> 16);
+        const int target_slot = (slot > 0) ? slot : ec.slot_of[g];
+        if (target_slot < ec.s0[p]) continue;
+        char* at = ec.pool[p] + (size_t) (target_slot - ec.s0[p]) * ec.slot_bytes[p];
         if (o < ug) reinterpret_cast<uint4*>(at)[o] = reinterpret_cast<const uint4*>(ec.host_gu[g])[o];
         else reinterpret_cast<uint4*>(at + ec.dn_off[p])[o - ug] = reinterpret_cast<const uint4*>(ec.host_dn[g])[o - ug];
     }
@@ -1834,13 +1839,46 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st) {
     k_cache_copy<<<640, 256, 0, (cudaStream_t) st>>>(ec, p, list, ec.dn_off[p], ec.slot_bytes[p] - ec.dn_off[p]);
     ck_launch("cache_copy");
 }
+__global__ void __launch_bounds__(32) k_cache_commit(ExpertCache ec, int p, const int* list) {
+    const int n = list[0];
+    for (int k = threadIdx.x; k < n; k += 32) {
+        const int g = list[1 + k];
+        const int s = ec.slot_of[g];
+        if (s >= ec.s0[p]) {
+            char* at = ec.pool[p] + (size_t) (s - ec.s0[p]) * ec.slot_bytes[p];
+            ec.ep_gu[g] = at;
+            ec.ep_dn[g] = at + ec.dn_off[p];
+        }
+    }
+}
+__global__ void __launch_bounds__(32) k_dmz_commit(ExpertCache ec, int p, const int* list) {
+    const int n = list[0];
+    for (int k = threadIdx.x; k < n; k += 32) {
+        const unsigned int packed = (unsigned int) list[1 + k];
+        const int g = (int) (packed & 0xffffu);
+        const int slot = (int) (packed >> 16);
+        if (slot >= ec.s0[p]) {
+            ec.owner[slot] = g;
+            ec.slot_of[g] = slot;
+            char* at = ec.pool[p] + (size_t) (slot - ec.s0[p]) * ec.slot_bytes[p];
+            ec.ep_gu[g] = at;
+            ec.ep_dn[g] = at + ec.dn_off[p];
+        }
+    }
+}
 void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs) {
     const int p = ec.pool_of[layer];
     if (gu_stride != ec.dn_off[p] || ec.dn_off[p] + dn_stride != ec.slot_bytes[p])
         throw std::runtime_error("moe_cache: the layer's experts are not its pool's size");
     if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
-    k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+    k_cache_copy<<<64, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+    k_dmz_commit<<<1, 32, 0, (cudaStream_t) st>>>(ec, p, list);
     ck_launch("moe_cache");
+}
+void moe_cache_commit(int layer, const ExpertCache& ec, const int* list, void* st) {
+    const int p = ec.pool_of[layer];
+    k_cache_commit<<<1, 32, 0, (cudaStream_t) st>>>(ec, p, list);
+    ck_launch("moe_cache_commit");
 }
 namespace {
 // the arena pool's slots [from, to) lent (their experts to RAM, the slots empty and ref 3), or [to, from) given back
@@ -2020,15 +2058,43 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
         if (e && std::strcmp(e, "0") && std::strcmp(e, "1")) throw std::runtime_error(std::string("FNX_PF_GDN_CHUNK: 0 or 1, not '") + e + "'");
         return !e || !std::strcmp(e, "1");
     }();
-    if (chunked) {
-        static thread_local bool smem_set[16] = {};
-        int dev = 0;
-        cudaGetDevice(&dev);
-        if (!smem_set[dev]) {
-            if (cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM) != cudaSuccess)
-                ck_launch("gdn_prompt: shared memory");
-            smem_set[dev] = true;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    // which prompt GDN scan a card really runs, once per card and without FNX_PF_TIMING: on sm_75 the sub-chunk scan's
+    // dynamic shared memory (GCH_REC_SMEM) is over what a Turing block may opt into, so every prompt takes the
+    // row-by-row kernel however FNX_PF_GDN_CHUNK is set (measured, not assumed)
+    auto report_gdn = [&](bool chunk, const char* why) {
+        static int done[16] = {};
+        if (dev < 0 || dev >= 16 || done[dev]) return;
+        done[dev] = 1;
+        int smem_block = -1, smem_optin = -1, cc_maj = 0, cc_min = 0;
+        if (cudaDeviceGetAttribute(&smem_block, cudaDevAttrMaxSharedMemoryPerBlock, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&smem_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&cc_maj, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&cc_min, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) cudaGetLastError();
+        std::fprintf(stderr,
+                     "fnx: prompt GDN path: card %d sm_%d%d, %s, scan %s: sub-chunk needs %zu B of dynamic shared memory, "
+                     "a block here takes %d B (opt-in up to %d B)\n",
+                     dev, cc_maj, cc_min, why, chunk ? "sub-chunk k_gdn_ch_rec" : "row-by-row k_gdn_pf_rec", GCH_REC_SMEM,
+                     smem_block, smem_optin);
+    };
+    bool use_chunked = chunked;
+    if (use_chunked) {
+        static thread_local int smem_ok[16] = {};
+        if (smem_ok[dev] == 0) {
+            if (cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM) != cudaSuccess) {
+                cudaGetLastError(); // Clear invalid argument on sm_75 (64KB smem limit) and fall back to k_gdn_pf_rec
+                smem_ok[dev] = -1;
+            } else {
+                smem_ok[dev] = 1;
+            }
         }
+        if (smem_ok[dev] < 0) use_chunked = false;
+    }
+    if (!chunked) report_gdn(false, "FNX_PF_GDN_CHUNK=0");
+    else if (!use_chunked) report_gdn(false, "FNX_PF_GDN_CHUNK=1 refused by this card");
+    else report_gdn(true, "FNX_PF_GDN_CHUNK=1");
+    if (use_chunked) {
         // FNX_PF_GDN_CHECK=1 (debugging): the row-by-row kernel on the same inputs first, then how far the sub-chunk
         // path's outputs and end state are from its (largest difference over the largest value)
         static const bool check = std::getenv("FNX_PF_GDN_CHECK") != nullptr;
@@ -2111,9 +2177,44 @@ size_t gdn_prompt_work_floats(int C, int nv) { return (size_t) ((C + GCH - 1) / 
 
 namespace fnx {
 #if FNX_KPART == 8
+__global__ void __launch_bounds__(256) k_cpu_moe_merge(CpuMoeBox* box, float* part) {
+    if (!box) return;
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (box->n_miss > 0) {
+            const unsigned long long target = box->req_seq;
+            while (*(volatile const unsigned long long*) &box->done_seq < target) {
+                __nanosleep(64);
+            }
+            __threadfence_system();
+        }
+    }
+    __syncthreads();
+    const int n_miss = box->n_miss;
+    if (n_miss <= 0) return;
+    int total_slots = 0;
+    for (int m = 0; m < n_miss; ++m) {
+        const int mn = box->miss_n[m];
+        for (int s = 0; s < mn; ++s) {
+            const int out_slot = box->miss_out[m][s];
+            const float* src = box->y_out + (size_t) (total_slots + s) * N;
+            float* dst = part + (size_t) out_slot * N;
+            for (int i = threadIdx.x; i < N; i += 256) {
+                dst[i] = src[i];
+            }
+        }
+        total_slots += mn;
+    }
+}
+
+void cpu_moe_merge(CpuMoeBox* d_cpu_box, float* part, void* st) {
+    if (!d_cpu_box) return;
+    k_cpu_moe_merge<<<1, 256, 0, (cudaStream_t) st>>>(d_cpu_box, part);
+    ck_launch("cpu_moe_merge");
+}
+
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out) {
+                  float* sh_out, CpuMoeBox* d_cpu_box) {
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2130,7 +2231,7 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     unsigned* counter = (unsigned*) (njobs + 1);
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
+#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, d_cpu_box)
     switch (T) {
         case 1: FNX_RR(1); break;
         case 2: FNX_RR(2); break;

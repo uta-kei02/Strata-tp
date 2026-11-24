@@ -124,3 +124,9 @@ node_modules/
 /build-vision-spark/
 /terminal/.venv-build/
 /.venv-build/
+
+# local build artifacts (M2 split engine): 116 MB each, over GitHub 100 MB limit -- rebuild from engine/src (see docs/build_report.md)
+/engine/strata-split-2-sm75
+/engine/strata-split-3-sm75
+/engine/strata-split-2
+/engine/strata-split-3

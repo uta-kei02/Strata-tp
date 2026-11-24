@@ -16,6 +16,12 @@
 set(STRATA_SPLIT_CARDS "2" CACHE STRING "card counts strata-split is built for (2, 3, 4)")
 set(STRATA_SPLIT_ARCH "" CACHE STRING "compute capability strata-split is built for (e.g. 86)")
 set(STRATA_SPLIT_PF_JOB "64" CACHE STRING "rows of one expert per prompt-path job: 64 (default) or 128")
+# (tp-opt) STRATA_SPLIT_FAT_ARCHS: extra compute capabilities to put REAL SASS for in the same executable, beside
+# STRATA_SPLIT_ARCH (e.g. "120" next to 75: the RTX 5070 as an opt-in third card of a two-2080-Ti pool, which has no
+# second 50-series card of its own). The device code stays written for the FNX_ARCH floor, so every listed card runs
+# the same program natively; no PTX is added (-real only, a PTX program at load is a different program from the one the
+# self-test ran). card_check.hpp accepts a card whose cc is in FNX_FAT_CC; empty changes nothing (upstream build).
+set(STRATA_SPLIT_FAT_ARCHS "" CACHE STRING "extra compute capabilities strata-split carries SASS for (e.g. 120), empty: STRATA_SPLIT_ARCH alone")
 
 set(_fnx_hip OFF)
 if(STRATA_ENABLE_HIP AND NOT STRATA_ENABLE_CUDA AND NOT WIN32 AND NOT APPLE)
@@ -67,7 +73,7 @@ endif()
 set(_sp ${CMAKE_CURRENT_SOURCE_DIR})
 set(_sp_engine
     ${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu
-    ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
+  ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/l2_offload.cu ${_sp}/src/l2_pf.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
 if(_fnx_hip)
   list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp)
 endif()
@@ -79,7 +85,8 @@ endif()
 set_source_files_properties(${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/session.cpp ${_sp}/src/batch.cpp
                             ${_sp}/tools/sfnx.cpp PROPERTIES LANGUAGE ${_fnx_lang})
 if(_fnx_hip)
-  set_source_files_properties(${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/selftest.cu PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu
+    ${_sp}/src/l2_offload.cu ${_sp}/src/l2_pf.cu ${_sp}/src/selftest.cu PROPERTIES LANGUAGE HIP)
 endif()
 # kernels.cu is compiled in nine parts (FNX_KPART), each with its share of the launchers, so the build runs in parallel
 set(_sp_kparts "")
@@ -105,11 +112,27 @@ if(TARGET strata_kernels AND TARGET strata_core)
 endif()
 
 foreach(_n ${STRATA_SPLIT_CARDS})
-  if(NOT _n MATCHES "^[234]$")
-    message(FATAL_ERROR "STRATA_SPLIT_CARDS: 2, 3 or 4, not ${_n}")
+  if(NOT _n MATCHES "^[23468]$")
+    message(FATAL_ERROR "STRATA_SPLIT_CARDS: 2, 3, 4, 6 or 8, not ${_n}")
   endif()
+  # (tp-opt) the device code of this executable: STRATA_SPLIT_ARCH plus every extra cc in STRATA_SPLIT_FAT_ARCHS, real SASS only
+  set(_split_dev_archs "${STRATA_SPLIT_ARCH}-real")
+  set(_split_fat_cc "${STRATA_SPLIT_ARCH}")
+  foreach(_a ${STRATA_SPLIT_FAT_ARCHS})
+    if(NOT _a MATCHES "^[0-9]+$")
+      message(FATAL_ERROR "STRATA_SPLIT_FAT_ARCHS: compute capabilities only, not ${_a}")
+    endif()
+    if(NOT _a STREQUAL STRATA_SPLIT_ARCH)
+      string(APPEND _split_dev_archs ";${_a}-real")
+      string(APPEND _split_fat_cc " ${_a}")
+    endif()
+  endforeach()
   set(_t strata-split-${_n})
-  add_executable(${_t} ${_sp_engine} ${_sp_kparts})
+  add_executable(${_t} ${_sp_engine} ${_sp_kparts}
+    ${CMAKE_SOURCE_DIR}/src/dsv41/ds4_gg_cpu.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsv41/ds4_iq_cpu.cpp
+    ${CMAKE_SOURCE_DIR}/src/dsv41/ds4_tq_cpu.cpp
+    ${CMAKE_SOURCE_DIR}/src/tpopt/tp_peer.cpp)
   if(_fnx_hip)
     # HIP: src/hip first (cuda.h, mma.h stand-ins), the force-included fnx_hip.h after the tree's cuda_runtime.h shim
     target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
@@ -126,15 +149,28 @@ foreach(_n ${STRATA_SPLIT_CARDS})
     endif()
     continue()
   endif()
-  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant})
-  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
-                             FNX_DIR="${_sp}")
+  # (tp-opt) the vendored src/dsv41 CPU readers include ggml.h / ggml-cpu.h / ggml-common.h. ggml/src/ggml-cuda is gone since own-stack step 10, so the
+  # paths are src + include only; ${_sp_quant} is engine/include, where strata/kernels/cpu/* lives (the old ${CMAKE_SOURCE_DIR}/include was the same dir)
+  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant} ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/include)
+  # (tp-opt) ds4_gg_cpu.cpp calls ggml-cpu's row dots (ggml_cpu_init, ggml_row_size, ggml_get_type_traits_cpu). A release engine
+  # configures no ggml at all (engine/CMakeLists.txt: "Strata: no ggml in this build"), and cmake/backends/cpu.cmake links ggml to
+  # strata_kernels_cpu PUBLIC only when the build already has it. The split's CPU expert lane needs it, so ask for the vendored
+  # ggml-base / ggml-cpu here (the macro comes from cmake/strata_ggml.cmake; EXCLUDE_FROM_ALL: nothing else in the tree is rebuilt).
+  if(NOT TARGET ggml-base)
+    enable_language(C)
+    strata_ggml_configure_root()
+  endif()
+  target_compile_definitions(${_t} PRIVATE STRATA_DSV41_TQ_CPU=1 FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
+                             FNX_DIR="${_sp}" FNX_FAT_CC="${_split_fat_cc}")
   target_compile_options(${_t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
-  set_target_properties(${_t} PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
+  set_target_properties(${_t} PROPERTIES CUDA_ARCHITECTURES "${_split_dev_archs}" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
                         CXX_STANDARD 17)
   find_package(Threads REQUIRED)
   find_package(CUDAToolkit REQUIRED)
-  target_link_libraries(${_t} PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cuda_driver Threads::Threads)
+  target_link_libraries(${_t} PRIVATE strata_kernels_cpu strata_kernels strata_core CUDA::cublas CUDA::cublasLt CUDA::cuda_driver Threads::Threads)
+  if(TARGET ggml-cpu AND TARGET ggml-base)
+    target_link_libraries(${_t} PRIVATE ggml-cpu ggml-base)
+  endif()
   if(_sp_df2)
     target_compile_definitions(${_t} PRIVATE FNX_DF2=1)
     target_link_libraries(${_t} PRIVATE strata_split_df2)

@@ -197,6 +197,7 @@ struct CardW {
     size_t host_bytes = 0;             // routed experts' copies in RAM (page-locked, mapped)
     ExpertCache ec;                    // n_slots 0: every routed expert in VRAM at its DW's p
     std::vector<const char*> ec_host_gu, ec_host_dn;   // ec.host_gu / host_dn on the host
+    std::vector<const char*> cpu_host_gu, cpu_host_dn; // pure host RAM ptrs for CPU MoE offload
     std::vector<int> ec_owner0, ec_slot0;   // ec.owner / slot_of as loaded (an arena engine starts from them again)
     std::vector<void*> expert_mem;     // what Model::place_experts allocated (freed by free_experts)
     size_t expert_bytes = 0;

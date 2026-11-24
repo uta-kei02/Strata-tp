@@ -88,6 +88,7 @@ struct ConvCache {
     std::vector<CachedConv> parked;
     long clock = 0, evictions = 0;
     size_t budget = 0;   // bytes of host memory for parked conversations and checkpoints
+    size_t slots = 0;    // the most conversations that may be parked at once (--conversation-cache-slots; 0: only the budget bounds it)
 };
 
 class Session {

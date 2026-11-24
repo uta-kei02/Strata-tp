@@ -1,6 +1,7 @@
 // The parts of the Engine (engine.hpp) that do not depend on the model, for every model's build: see engine_parts.hpp.
 #include "engine_parts.hpp"
 #include "env.hpp"
+#include "../../tpopt/tp_opt.hpp"
 
 #include <cuda_runtime.h>
 
@@ -344,13 +345,14 @@ void Engine::warm_graphs() {
             if (!D.mrope_buf) D.mrope_buf = dalloc<int>((size_t) max_ctx_ * 3);
     }
     std::fprintf(stderr, "fnx: warm: verify windows ...\n");
-    for (int T = 1; T <= MAXT; ++T) {
+    const int warm_max_t = (int) env_int("FNX_WARM_MAXT", 4);
+    for (int T = 1; T <= warm_max_t; ++T) {
         verify(std::vector<int>((size_t) T, tok));
         commit(1);
-        if (T == 1 || T == MAXT) std::fprintf(stderr, "fnx: warm: verify %d rows done\n", T);
+        std::fprintf(stderr, "fnx: warm: verify %d rows done%c", T, 10);
     }
-    if (mtp_)
-        for (int T = 1; T <= MAXT; ++T) draft(T, true, 0, std::vector<int>((size_t) T, tok), 0);
+    if (mtp_ && env_int("FNX_SPEC_DRAFTS", 3) > 0)
+        for (int T = 1; T <= warm_max_t; ++T) draft(T, true, 0, std::vector<int>((size_t) T, tok), 0);
     for (int n = 1; n <= std::min((int) lanes.size(), MAXT); ++n)
         step(std::vector<int>(lanes.begin(), lanes.begin() + n), std::vector<int>((size_t) n, tok));
     // batched windows with drafts (they share step()'s graph slots, one per row count): 2 .. MAXT rows over as many lanes
@@ -849,6 +851,9 @@ std::vector<int> Engine::verify(const std::vector<int>& tokens) {
     }
     unsigned err = 0;
     float gpu_ms = 0.f;
+    // the wait every window ends with is where a cross-card exchange that never comes back shows up: armed for this scope,
+    // so a card that stops answering costs one line and a restart (FNX_TP_WATCHDOG_S, default 300 s, 0 = off)
+    tpopt::WaitGuard guard("the window's stream sync");
     each([&](int c, CardBuf& b, const CardW&) {
         ck(cudaStreamSynchronize(b.st), "window sync");
         err |= h_.err[c];

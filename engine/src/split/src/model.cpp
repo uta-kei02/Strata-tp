@@ -2,8 +2,10 @@
 #include "card_check.hpp"
 #include "env.hpp"
 #include "expert_residency.hpp"
+#include "l2_offload.hpp"
 #include "memlock.hpp"
 #include "rope_gguf.hpp"
+#include "../../tpopt/tp_opt.hpp"
 
 #include "store.hpp"
 #if FNX_HIP
@@ -33,6 +35,15 @@
 #include <thread>
 
 namespace fnx {
+
+static inline void advise_inner_pages(const char* ptr, size_t bytes, int advice) {
+    if (!ptr || bytes < 4096) return;
+    constexpr uintptr_t PG = 4096;
+    const uintptr_t s = (reinterpret_cast<uintptr_t>(ptr) + PG - 1) & ~(PG - 1);
+    const uintptr_t e = (reinterpret_cast<uintptr_t>(ptr) + bytes) & ~(PG - 1);
+    if (e > s) madvise(reinterpret_cast<void*>(s), e - s, advice);
+}
+
 
 namespace {
 
@@ -306,7 +317,9 @@ struct Up {
     void expert_cache(const std::vector<std::vector<char>>& res, const std::vector<const char*>& hgu, const std::vector<const char*>& hdn,
                       const std::vector<double>* arena_score) {
         ExpertCache& ec = c.ec;
-        std::vector<std::pair<size_t, size_t>> sizes;   // each pool's (gate|up, down) bytes
+        const char* sw_env = std::getenv("FNX_SWAP_SLOTS");
+        const int swap_slots = sw_env ? std::max(0, std::atoi(sw_env)) : 64;
+        std::vector<std::pair<size_t, size_t>> sizes;
         for (int l = 0; l < NL; ++l) {
             const LayerW& L = c.L[(size_t) l];
             if (L.gu_e_stride % 16 || L.down_e_stride % 16) throw std::runtime_error("expert cache: expert strides not in 16-byte units");
@@ -320,7 +333,7 @@ struct Up {
             ec.pool_of[l] = (int) (it - sizes.begin());
         }
         ec.n_pools = (int) sizes.size();
-        if (arena_score) {   // the largest pool by bytes
+        if (arena_score) {
             size_t most = 0;
             for (int p = 0; p < ec.n_pools; ++p) {
                 size_t b = 0;
@@ -329,6 +342,7 @@ struct Up {
             }
         }
         std::vector<int> owner, slot_of((size_t) NL * NEXP, -1);
+        int immortal[EC_POOLS] = {};
         for (int p = 0; p < ec.n_pools; ++p) {
             ec.s0[p] = (int) owner.size();
             for (int l = 0; l < NL; ++l)
@@ -346,9 +360,14 @@ struct Up {
             ec.dn_off[p] = sizes[(size_t) p].first;
             ec.slot_bytes[p] = sizes[(size_t) p].first + sizes[(size_t) p].second;
             if (p == ec.arena_pool) continue;
-            ck(cudaMalloc(&ec.pool[p], (size_t) ec.n[p] * ec.slot_bytes[p]), "expert cache: slots");
-            if (track) track->push_back(ec.pool[p]);
-            c.bytes += (size_t) ec.n[p] * ec.slot_bytes[p];
+            if (!ec.pool[p]) {
+                ck(cudaMalloc(&ec.pool[p], (size_t) ec.n[p] * ec.slot_bytes[p]), "expert cache: slots");
+                if (track) track->push_back(ec.pool[p]);
+                c.bytes += (size_t) ec.n[p] * ec.slot_bytes[p];
+            }
+            if (!arena_score && ec.n[p] > swap_slots) {
+                immortal[p] = ec.n[p] - swap_slots;
+            }
         }
         ec.n_slots = (int) owner.size();
         ec.arena_full = arena_score && ec.n_slots == NL * NEXP;
@@ -358,8 +377,10 @@ struct Up {
             if (p == ec.arena_pool) continue;
             const LayerW& L = c.L[(size_t) (i / NEXP)];
             char* at = ec.pool[p] + (size_t) (s - ec.s0[p]) * ec.slot_bytes[p];
-            ck(cudaMemcpy(at, hgu[(size_t) i], L.gu_e_stride, cudaMemcpyDefault), "expert cache: fill");
-            ck(cudaMemcpy(at + ec.dn_off[p], hdn[(size_t) i], L.down_e_stride, cudaMemcpyDefault), "expert cache: fill");
+            if (hgu[(size_t) i] != at) {
+                ck(cudaMemcpy(at, hgu[(size_t) i], L.gu_e_stride, cudaMemcpyDefault), "expert cache: fill");
+                ck(cudaMemcpy(at + ec.dn_off[p], hdn[(size_t) i], L.down_e_stride, cudaMemcpyDefault), "expert cache: fill");
+            }
             epg[(size_t) i] = at;
             epd[(size_t) i] = at + ec.dn_off[p];
         }
@@ -369,19 +390,34 @@ struct Up {
         ec.host_dn = put<const char*>(hdn.data(), hdn.size() * sizeof(char*));
         c.ec_host_gu = hgu;
         c.ec_host_dn = hdn;
-        ec.slot_of = put<int>(slot_of.data(), slot_of.size() * sizeof(int));
+        std::vector<int> slot_and_freq(slot_of.size() * 2, 0);
+        std::copy(slot_of.begin(), slot_of.end(), slot_and_freq.begin());
+        for (size_t idx = 0; idx < slot_of.size(); ++idx) {
+            if (slot_of[idx] >= 0) slot_and_freq[slot_of.size() + idx] = 192;
+        }
+        ec.slot_of = put<int>(slot_and_freq.data(), slot_and_freq.size() * sizeof(int));
         c.ec_owner0 = owner;
         c.ec_slot0 = slot_of;
         ec.owner = put<int>(owner.data(), owner.size() * sizeof(int));
         const std::vector<unsigned char> ref((size_t) ec.n_slots, 0);
         ec.ref = put<unsigned char>(ref.data(), ref.size());
-        ec.hand = put<int>(ec.s0, sizeof ec.s0);   // each pool's hand at its first slot
-        const int none[EC_POOLS] = {};
+        int hand_init[EC_POOLS] = {};
+        for (int p = 0; p < EC_POOLS; ++p) hand_init[p] = ec.s0[p] + immortal[p];
+        ec.hand = put<int>(hand_init, sizeof hand_init);
+        const char* th_env = std::getenv("FNX_SWAP_THRESH");
+        const char* cp_env = std::getenv("FNX_SWAP_CAP");
+        const int sw_thresh = (th_env && *th_env) ? std::max(1, std::atoi(th_env)) : 15;
+        const int sw_cap = (cp_env && *cp_env) ? std::max(1, std::atoi(cp_env)) : 2;
+        const int none[EC_POOLS + 4] = {0, 0, 0, 0, 0, sw_thresh, sw_cap, 0};
         ec.lent = put<int>(none, sizeof none);
         for (int l = 0; l < NL; ++l) {
             c.L[(size_t) l].gu_e.ep = ec.ep_gu + (size_t) l * NEXP;
             c.L[(size_t) l].down_e.ep = ec.ep_dn + (size_t) l * NEXP;
         }
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        std::fprintf(stderr, "[DEBUG-FNX] card %d expert_cache DONE: pools=%d, total_slots=%d, gpu_used=%.2f GiB, host_pinned=%.2f GiB, free_vram=%.2f GiB%c",
+                     c.dev, ec.n_pools, ec.n_slots, (double) c.bytes / (1ULL << 30), (double) c.host_bytes / (1ULL << 30), (double) free_b / (1ULL << 30), 10);
     }
     // row r of t (counting every matrix's rows, in order), which must be one of its rows: a row list made from the model's
     // geometry would otherwise read the next tensor's bytes from the mapping when a GGUF's tensor is shorter than it
@@ -745,6 +781,8 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
 // The tensors come from st: group l is layer l's, group NL the output head's (stage_groups); each group is given back
 // once this card is through with it.
 // host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory
+static std::vector<std::pair<size_t, size_t>> g_layer_exp_sizes;
+
 void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resident, const std::vector<double>* arena_score,
                Store* store, bool host_experts) {
     ck(cudaSetDevice(c.dev), "cudaSetDevice");
@@ -844,8 +882,126 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             w.idx_qn = up.f32(L(l, "indexer.q_norm.weight"), QSA_KEY);
             w.idx_kn = up.f32(L(l, "indexer.k_norm.weight"), QSA_KEY);
         }
-        w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg);
-        w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
+        if (!resident.empty() && !store && !arena_score && g_layer_exp_sizes.size() == (size_t) NL) {
+            const char* sw_env = std::getenv("FNX_SWAP_SLOTS");
+            const int swap_slots = sw_env ? std::max(0, std::atoi(sw_env)) : 64;
+            w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, nullptr);
+            w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, nullptr);
+            ExpertCache& ec = c.ec;
+            if (l == 0) {
+                std::vector<std::pair<size_t, size_t>> psizes;
+                const size_t ff_slice = (size_t) (c.ff1 - c.ff0);
+                for (int ll = 0; ll < NL; ++ll) {
+                    const std::pair<size_t, size_t> s{
+                        g_layer_exp_sizes[(size_t) ll].first * ff_slice / FF,
+                        g_layer_exp_sizes[(size_t) ll].second * ff_slice / FF
+                    };
+                    auto it = std::find(psizes.begin(), psizes.end(), s);
+                    if (it == psizes.end()) {
+                        psizes.push_back(s);
+                        it = psizes.end() - 1;
+                    }
+                    ec.pool_of[ll] = (int) (it - psizes.begin());
+                }
+                ec.n_pools = (int) psizes.size();
+                int total_s = 0;
+                for (int p = 0; p < ec.n_pools; ++p) {
+                    ec.s0[p] = total_s;
+                    int cnt = 0;
+                    for (int ll = 0; ll < NL; ++ll)
+                        if (ec.pool_of[ll] == p)
+                            for (int ee = 0; ee < NEXP; ++ee)
+                                if (resident[(size_t) ll][(size_t) ee]) ++cnt;
+                    ec.n[p] = cnt;
+                    total_s += cnt;
+                    ec.dn_off[p] = psizes[(size_t) p].first;
+                    ec.slot_bytes[p] = psizes[(size_t) p].first + psizes[(size_t) p].second;
+                    ck(cudaMalloc(&ec.pool[p], (size_t) ec.n[p] * ec.slot_bytes[p]), "expert cache: direct vram pool");
+                    c.expert_mem.push_back(ec.pool[p]);
+                    c.bytes += (size_t) ec.n[p] * ec.slot_bytes[p];
+                }
+                ec.n_slots = total_s;
+            }
+            const int p = ec.pool_of[l];
+            int slot_in_p = 0;
+            for (int ll = 0; ll < l; ++ll)
+                if (ec.pool_of[ll] == p)
+                    for (int ee = 0; ee < NEXP; ++ee)
+                        if (resident[(size_t) ll][(size_t) ee]) ++slot_in_p;
+            const int immortal_lim = ec.n[p] > swap_slots ? (ec.n[p] - swap_slots) : 0;
+            int need_host = 0;
+            int sim_slot = slot_in_p;
+            for (int e = 0; e < NEXP; ++e) {
+                if (resident[(size_t) l][(size_t) e]) {
+                    if (sim_slot >= immortal_lim) ++need_host;
+                    ++sim_slot;
+                } else {
+                    ++need_host;
+                }
+            }
+            const size_t exp_b = w.gu_e_stride + w.down_e_stride;
+            char* h_block = nullptr;
+            char* d_mapped = nullptr;
+            if (need_host > 0) {
+                const size_t h_bytes = (size_t) need_host * exp_b;
+                ck(cudaHostAlloc((void**) &h_block, h_bytes, cudaHostAllocMapped), "direct loader: host swap buf");
+                ck(cudaHostGetDevicePointer((void**) &d_mapped, (void*) h_block, 0), "direct loader: mapped ptr");
+                c.host_bytes += h_bytes;
+            }
+            if (c.cpu_host_gu.size() < (size_t) NL * NEXP) {
+                c.cpu_host_gu.resize((size_t) NL * NEXP, nullptr);
+                c.cpu_host_dn.resize((size_t) NL * NEXP, nullptr);
+            }
+            int h_idx = 0;
+            for (int e = 0; e < NEXP; ++e) {
+                const char* src_gu = (const char*) w.gu_e.p + (size_t) e * w.gu_e_stride;
+                const char* src_dn = (const char*) w.down_e.p + (size_t) e * w.down_e_stride;
+                if (resident[(size_t) l][(size_t) e]) {
+                    char* at = ec.pool[p] + (size_t) slot_in_p * ec.slot_bytes[p];
+                    ck(cudaMemcpyAsync(at, src_gu, w.gu_e_stride, cudaMemcpyDeviceToDevice, (cudaStream_t)0), "direct loader: vram gu");
+                    ck(cudaMemcpyAsync(at + ec.dn_off[p], src_dn, w.down_e_stride, cudaMemcpyDeviceToDevice, (cudaStream_t)0), "direct loader: vram dn");
+                    if (slot_in_p < immortal_lim) {
+                        hg[e] = at;
+                        hd[e] = at + ec.dn_off[p];
+                    } else {
+                        char* dst_h = h_block + (size_t) h_idx * exp_b;
+                        char* dst_d = d_mapped + (size_t) h_idx * exp_b;
+                        ++h_idx;
+                        ck(cudaMemcpyAsync(dst_h, src_gu, w.gu_e_stride, cudaMemcpyDeviceToHost, (cudaStream_t)0), "direct loader: swap gu");
+                        ck(cudaMemcpyAsync(dst_h + w.gu_e_stride, src_dn, w.down_e_stride, cudaMemcpyDeviceToHost, (cudaStream_t)0), "direct loader: swap dn");
+                        hg[e] = dst_d;
+                        hd[e] = dst_d + w.gu_e_stride;
+                        c.cpu_host_gu[(size_t) l * NEXP + e] = dst_h;
+                        c.cpu_host_dn[(size_t) l * NEXP + e] = dst_h + w.gu_e_stride;
+                    }
+                    ++slot_in_p;
+                } else {
+                    char* dst_h = h_block + (size_t) h_idx * exp_b;
+                    char* dst_d = d_mapped + (size_t) h_idx * exp_b;
+                    ++h_idx;
+                    ck(cudaMemcpyAsync(dst_h, src_gu, w.gu_e_stride, cudaMemcpyDeviceToHost, (cudaStream_t)0), "direct loader: cold gu");
+                    ck(cudaMemcpyAsync(dst_h + w.gu_e_stride, src_dn, w.down_e_stride, cudaMemcpyDeviceToHost, (cudaStream_t)0), "direct loader: cold dn");
+                    hg[e] = dst_d;
+                    hd[e] = dst_d + w.gu_e_stride;
+                    c.cpu_host_gu[(size_t) l * NEXP + e] = dst_h;
+                    c.cpu_host_dn[(size_t) l * NEXP + e] = dst_h + w.gu_e_stride;
+                }
+            }
+            ck(cudaStreamSynchronize((cudaStream_t)0), "direct loader: sync (cudaStream_t)0");
+            ck(cudaFree(w.gu_e.p), "direct loader: free temp gu");
+            ck(cudaFree(w.down_e.p), "direct loader: free temp dn");
+            c.bytes -= (size_t) NEXP * (w.gu_e_stride + w.down_e_stride);
+            w.gu_e.p = w.down_e.p = nullptr;
+            if (c.dev == 0 && (l == 0 || l == 15 || l == 31 || l == 47)) {
+                size_t free_b = 0, total_b = 0;
+                cudaMemGetInfo(&free_b, &total_b);
+                std::fprintf(stderr, "[DEBUG-FNX] Layer %2d/48 done: card0 gpu_alloc=%.2f GiB, host_pinned=%.2f GiB, free_vram=%.2f GiB%c",
+                             l + 1, (double) c.bytes / (1ULL << 30), (double) c.host_bytes / (1ULL << 30), (double) free_b / (1ULL << 30), 10);
+            }
+        } else {
+            w.gu_e = up.expert_rows2(L(l, "ffn_gate_exps.weight"), L(l, "ffn_up_exps.weight"), c.ff0, c.ff1, w.gu_e_stride, hg);
+            w.down_e = up.expert_cols(L(l, "ffn_down_exps.weight"), c.ff0 / 32, c.ff1 / 32, w.down_e_stride, hd);
+        }
         w.sh_gu = up.dense(up.rows2(L(l, "ffn_gate_shexp.weight"), range(c.ff0, c.ff1), L(l, "ffn_up_shexp.weight"), range(c.ff0, c.ff1)));
         w.sh_down = up.dense(up.cols(L(l, "ffn_down_shexp.weight"), range(c.ff0 / 32, c.ff1 / 32)));
         if (!w.sh_gu.s.q || !w.sh_down.s.q) throw std::runtime_error("fnx: the shared expert is not Q8_0");
@@ -1241,10 +1397,14 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         ck(cudaGetDeviceCount(&ndev), "cudaGetDeviceCount");
         // a build for another count than the cards it is given is a config or build mistake (a 2-card binary on
         // prod's three would serve, slower): CUDA_VISIBLE_DEVICES (the config's "gpu") must name exactly NCARD
-        if (ndev != NCARD)
+        // ... plus, when FNX_L2_GPU asks for one, the spare card the expert tier lives on (l2_offload.hpp): the tensor
+        // parallel path still runs on exactly NCARD of them, check_cards() only looks at devs below NCARD
+        const int want_ndev = NCARD + (l2::requested_device() >= 0 ? 1 : 0);
+        if (ndev != want_ndev)
             throw std::runtime_error("fnx: built for " + std::to_string(NCARD) + " cards (FNX_NCARD), " + std::to_string(ndev) +
-                                     " visible: set CUDA_VISIBLE_DEVICES (a config's \"gpu\") to " + std::to_string(NCARD) +
-                                     " of them, or build for " + std::to_string(ndev) + " (make FNX_NCARD=" + std::to_string(ndev) + ")");
+                                     " visible: set CUDA_VISIBLE_DEVICES (a config's \"gpu\") to " + std::to_string(want_ndev) +
+                                     " of them" + (l2::requested_device() >= 0 ? " (NCARD plus FNX_L2_GPU)" : "") +
+                                     ", or build for " + std::to_string(ndev) + " (make FNX_NCARD=" + std::to_string(ndev) + ")");
         check_cards();
     }
     check_supported(g);
@@ -1425,10 +1585,184 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         return;
     }
     if (how == Load::HOLD && !store) throw std::runtime_error("fnx: holding needs a store");
+    // What the residency plan is about to map into host RAM (the experts that do not fit in VRAM, in GiB). Declared here,
+    // outside the !FNX_27B block below, because the host RAM check under the ceiling is compiled for both builds and a
+    // worker that ATTACHes the holder's tables never plans at all: -1 means "unknown, use the floor only".
+    double plan_host_experts_gib = -1.0;
 #if !FNX_27B
-    if (how == Load::PLAIN) choose_residency();   // the holder leaves that to its workers: every expert to a host copy
+    if (how == Load::PLAIN) {
+        choose_residency();
+        arena = false;
+        g_layer_exp_sizes.resize((size_t) NL);
+        size_t total_exp_b = 0;
+        std::vector<std::pair<size_t, size_t>> pool_types;
+        int layer_pool[NL] = {};
+        for (int l = 0; l < NL; ++l) {
+            const std::string b = "blk." + std::to_string(l) + ".";
+            const Tensor& tg = g.t(b + "ffn_gate_exps.weight");
+            const Tensor& tu = g.t(b + "ffn_up_exps.weight");
+            const Tensor& td = g.t(b + "ffn_down_exps.weight");
+            const size_t gu_b = (tg.type == T_Q2_0 ? tg.nbytes * 2 : tg.nbytes) + (tu.type == T_Q2_0 ? tu.nbytes * 2 : tu.nbytes);
+            const size_t dn_b = (td.type == T_Q2_0 ? td.nbytes * 2 : td.nbytes);
+            g_layer_exp_sizes[(size_t) l] = {gu_b / NEXP, dn_b / NEXP};
+            total_exp_b += gu_b + dn_b;
+            auto it = std::find(pool_types.begin(), pool_types.end(), g_layer_exp_sizes[(size_t) l]);
+            if (it == pool_types.end()) {
+                pool_types.push_back(g_layer_exp_sizes[(size_t) l]);
+                it = pool_types.end() - 1;
+            }
+            layer_pool[l] = (int) (it - pool_types.begin());
+        }
+        const char* res_env = std::getenv("FNX_VRAM_RESERVE_GIB");
+        const double reserve_gib = res_env ? std::atof(res_env) : 6.8;
+        double min_free_gib = 999.0, min_budget_gib = 999.0;
+        for (int c = 0; c < NCARD; ++c) {
+            ck(cudaSetDevice(cards[c].dev), "cudaSetDevice");
+            size_t free_b = 0, total_b = 0;
+            if (cudaMemGetInfo(&free_b, &total_b) == cudaSuccess) {
+                const double fg = (double) free_b / (double) (1ULL << 30);
+                const double tg = (double) total_b / (double) (1ULL << 30);
+                const double budget = tpopt::expert_budget_gib(tg, fg, reserve_gib);
+                std::fprintf(stderr, "[DEBUG-FNX] GPU %d initial VRAM: free=%.2f GiB / total=%.2f GiB -> the experts may take %.2f GiB (MAX VRAM の %.0f%% minus %.2f GiB reserve)%c",
+                             cards[c].dev, fg, tg, budget, tpopt::vram_fraction() * 100.0, reserve_gib, 10);
+                if (fg < min_free_gib) min_free_gib = fg;
+                if (budget < min_budget_gib) min_budget_gib = budget;
+            }
+        }
+        // the residency plan is symmetric, so the smallest card's budget is the plan's budget. That is what lets an optional
+        // third card (the 12 GiB RTX 5070 beside two 22 GiB RTX 2080 Ti's) be a card at all: it is never asked to hold the
+        // share a 22 GiB card holds, and the hot experts that miss there stay in host RAM instead of OOMing the load.
+        // (min_budget stays 999 when no card answered cudaMemGetInfo: then the old free-minus-reserve plan is kept)
+        const double max_exp_per_card_gib = min_budget_gib > 900.0 ? std::max(2.0, min_free_gib - reserve_gib) : min_budget_gib;
+        size_t max_total_vram_b = (size_t) (max_exp_per_card_gib * NCARD * (double) (1ULL << 30));
+        if (resident.empty()) {
+            resident.assign((size_t) NL, std::vector<char>((size_t) NEXP, 1));
+        }
+        const int min_pool_slots = EXPERT_WINDOW_SLOTS + 16;
+        int pool_cnt[EC_POOLS] = {};
+        for (int l = 0; l < NL; ++l)
+            for (int e = 0; e < NEXP; ++e)
+                if (resident[(size_t) l][(size_t) e]) ++pool_cnt[layer_pool[l]];
+        for (int p = 0; p < (int) pool_types.size(); ++p) {
+            if (pool_cnt[p] < min_pool_slots) {
+                std::vector<int> cand;
+                for (int l = 0; l < NL; ++l)
+                    if (layer_pool[l] == p)
+                        for (int e = 0; e < NEXP; ++e)
+                            if (!resident[(size_t) l][(size_t) e]) cand.push_back(l * NEXP + e);
+                if (score.size() == (size_t) NL * NEXP) {
+                    std::stable_sort(cand.begin(), cand.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
+                }
+                for (int idx : cand) {
+                    if (pool_cnt[p] >= min_pool_slots) break;
+                    resident[(size_t) (idx / NEXP)][(size_t) (idx % NEXP)] = 1;
+                    ++pool_cnt[p];
+                }
+                std::fprintf(stderr, "[DEBUG-FNX] Promoted pool %d slots to %d (minimum window requirement >= %d)%c",
+                             p, pool_cnt[p], EXPERT_WINDOW_SLOTS, 10);
+            }
+        }
+        size_t cur_vram_b = 0;
+        for (int l = 0; l < NL; ++l) {
+            const size_t eb = g_layer_exp_sizes[(size_t) l].first + g_layer_exp_sizes[(size_t) l].second;
+            for (int e = 0; e < NEXP; ++e)
+                if (resident[(size_t) l][(size_t) e]) cur_vram_b += eb;
+        }
+        std::fprintf(stderr, "[DEBUG-FNX] Before auto-cap: total_experts=%.2f GiB, initial_vram_experts=%.2f GiB, target_vram_cap=%.2f GiB (%.2f GiB/card)%c",
+                     (double) total_exp_b / (1ULL << 30), (double) cur_vram_b / (1ULL << 30),
+                     (double) max_total_vram_b / (1ULL << 30), max_exp_per_card_gib, 10);
+        if (cur_vram_b < max_total_vram_b) {
+            std::vector<int> cold_idx;
+            for (int l = 0; l < NL; ++l)
+                for (int e = 0; e < NEXP; ++e)
+                    if (!resident[(size_t) l][(size_t) e]) cold_idx.push_back(l * NEXP + e);
+            if (score.size() == (size_t) NL * NEXP) {
+                std::stable_sort(cold_idx.begin(), cold_idx.end(), [&](int a, int b) { return score[(size_t) a] > score[(size_t) b]; });
+            }
+            int promoted = 0;
+            for (int idx : cold_idx) {
+                const int l = idx / NEXP, e = idx % NEXP, p = layer_pool[l];
+                const size_t eb = g_layer_exp_sizes[(size_t) l].first + g_layer_exp_sizes[(size_t) l].second;
+                if (cur_vram_b + eb > max_total_vram_b) continue;
+                resident[(size_t) l][(size_t) e] = 1;
+                cur_vram_b += eb;
+                ++pool_cnt[p];
+                ++promoted;
+            }
+            if (promoted > 0) {
+                std::fprintf(stderr, "[DEBUG-FNX] Auto-promoted %d experts into GPU VRAM -> VRAM_experts=%.2f GiB (%.2f GiB/card), Host_RAM_experts=%.2f GiB [pools: %d, %d, %d, %d]%c",
+                             promoted, (double) cur_vram_b / (1ULL << 30), (double) cur_vram_b / NCARD / (1ULL << 30),
+                             (double) (total_exp_b - cur_vram_b) / (1ULL << 30),
+                             pool_cnt[0], pool_cnt[1], pool_cnt[2], pool_cnt[3], 10);
+            }
+        }
+        if (cur_vram_b > max_total_vram_b) {
+            std::vector<int> res_idx;
+            for (int l = 0; l < NL; ++l)
+                for (int e = 0; e < NEXP; ++e)
+                    if (resident[(size_t) l][(size_t) e]) res_idx.push_back(l * NEXP + e);
+            if (score.size() == (size_t) NL * NEXP) {
+                std::stable_sort(res_idx.begin(), res_idx.end(), [&](int a, int b) { return score[(size_t) a] < score[(size_t) b]; });
+            }
+            int demoted = 0;
+            for (int idx : res_idx) {
+                if (cur_vram_b <= max_total_vram_b) break;
+                const int l = idx / NEXP, e = idx % NEXP, p = layer_pool[l];
+                if (pool_cnt[p] <= min_pool_slots) continue;
+                const size_t eb = g_layer_exp_sizes[(size_t) l].first + g_layer_exp_sizes[(size_t) l].second;
+                resident[(size_t) l][(size_t) e] = 0;
+                cur_vram_b -= eb;
+                --pool_cnt[p];
+                ++demoted;
+            }
+            std::fprintf(stderr, "[DEBUG-FNX] Auto-offloaded %d experts -> VRAM_experts=%.2f GiB (%.2f GiB/card), Host_RAM_experts=%.2f GiB [pools: %d, %d, %d, %d]%c",
+                         demoted, (double) cur_vram_b / (1ULL << 30), (double) cur_vram_b / NCARD / (1ULL << 30),
+                         (double) (total_exp_b - cur_vram_b) / (1ULL << 30),
+                         pool_cnt[0], pool_cnt[1], pool_cnt[2], pool_cnt[3], 10);
+        }
+        // The plan is final here: the host copies below are pinned (cudaHostAlloc), so this is the largest single host
+        // allocation the load is going to make. Measured on this box: pinned lands in tmpfs/shmem (shared 24 GiB while
+        // 8000 is up, 149 MiB right after it stops) and the index/metadata that comes with it adds 2.18 GiB more
+        // (8000: Host_RAM_experts 21.36 vs host_pinned 11.77 GiB/card x 2).
+        plan_host_experts_gib = (double) (total_exp_b - cur_vram_b) / (double) (1ULL << 30);
+    }   // the holder leaves that to its workers: every expert to a host copy
 #endif
     const auto t0 = std::chrono::steady_clock::now();
+    // the host RAM ceiling (default 56 GiB, OS 込み: STRATA_TP_MEM_CAP_GIB / FNX_RAM_LIMIT_GB). A load that the OOM killer
+    // stops half way through leaves a stuck engine and a stack of log lines; one line here says what the ceiling leaves and
+    // refuses, so the operator can raise the cap or free RAM before anything is mapped. FNX_MEM_STRICT=0 turns the refusal
+    // into the line only (the launcher's cgroup memory.max is the hard version of the same number when it is available).
+    {
+        const double allow = tpopt::ram_allowance_gib();
+        if (allow >= 0.0) {
+            // The need is the plan, not a fixed floor. The 2nd bench run on this box planned 29.64 GiB of host experts
+            // while the ceiling left 9.9 GiB, passed a 6 GiB floor, loaded for 360 s and was killed by the host's
+            // systemd-oomd (memory PSI 50 % / 20 s) half way through - with the operator's 8000 already stopped.
+            // So: plan + FNX_RAM_MARGIN_GIB (default 4.0 GiB, for the pinned index/metadata 2.18 GiB + the
+            // conversation cache + one staged layer group). FNX_RAM_MIN_GIB (default 6.0) stays as the floor used
+            // when there is no plan (an ATTACHing worker, or a FNX_27B build).
+            const double floor_gib = tpopt::env_num("FNX_RAM_MIN_GIB", 6.0);
+            const double margin = tpopt::env_num("FNX_RAM_MARGIN_GIB", 4.0);
+            const bool have_plan = plan_host_experts_gib >= 0.0;
+            double need = floor_gib;
+            if (have_plan && plan_host_experts_gib + margin > need) need = plan_host_experts_gib + margin;
+            if (have_plan)
+                std::fprintf(stderr, "fnx: host RAM ceiling %.1f GiB (STRATA_TP_MEM_CAP_GIB / FNX_RAM_LIMIT_GB): %.1f GiB is left for the engine on this box; "
+                                     "the plan puts %.1f GiB of experts in host RAM and needs +%.1f GiB of margin = %.1f GiB%c",
+                             tpopt::mem_cap_gib(), allow, plan_host_experts_gib, margin, need, 10);
+            else
+                std::fprintf(stderr, "fnx: host RAM ceiling %.1f GiB (STRATA_TP_MEM_CAP_GIB / FNX_RAM_LIMIT_GB): %.1f GiB is left for the engine on this box; "
+                                     "no residency plan to size, so the floor is %.1f GiB%c",
+                             tpopt::mem_cap_gib(), allow, need, 10);
+            if (allow < need && tpopt::env_num("FNX_MEM_STRICT", 1.0) != 0.0)
+                throw std::runtime_error("fnx: the load needs " + std::to_string((long) (need + 0.5)) + " GiB of host RAM but only " +
+                                         std::to_string((long) allow) + " GiB is free under the " +
+                                         std::to_string((long) tpopt::mem_cap_gib()) +
+                                         " GiB ceiling: raise STRATA_TP_MEM_CAP_GIB, free RAM, or give more of the card to the experts "
+                                         "(--vram-pct / FNX_VRAM_PCT, or a lower --vram-reserve-gib / FNX_VRAM_RESERVE_GIB). "
+                                         "FNX_MEM_STRICT=0 starts anyway and lets the host OOM killer decide");
+        }
+    }
     Stager st(g, stage_groups(g), NCARD);
     std::vector<std::thread> th;
     std::vector<std::string> errs(NCARD);
@@ -1445,12 +1779,26 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     for (auto& t : th) t.join();
     for (int c = 0; c < NCARD; ++c)
         if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+    // 1段目: madvise(MADV_DONTNEED) でプロセスのページテーブル(Mapped)からGGUF領域を切り離す
+    // 2段目: PTEが外れた状態で posix_fadvise(POSIX_FADV_DONTNEED) を呼び、buff/cache からも即座に解放する
+    for (int s = 0; s < g.shards(); ++s) {
+        advise_inner_pages((const char*) g.shard_base(s), g.shard_size(s), MADV_DONTNEED);
+        int fd = ::open(g.shard_path(s).c_str(), O_RDONLY);
+        if (fd >= 0) {
+            ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+            ::close(fd);
+        }
+    }
     // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
     const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
     char rate[64] = "";
     if (cache < 0.05 * (disk + cache)) std::snprintf(rate, sizeof rate, " at %.2f GB/s", disk / st.read_seconds());
     std::fprintf(stderr, "fnx: weights read in %.1f s of reading (%.1f GB from the disk%s, %.1f GB from the page cache), placed in %.1f s\n",
                  st.read_seconds(), disk, rate, cache, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    // the spare card last: it takes the experts host RAM is holding, so it wants the residency plan and the profile's
+    // scores (choose_residency, and the load that filled them). The holder's shared memory is its own allocator, so the
+    // lab path keeps the tier off rather than cudaMalloc something the image cannot carry (docs/m2_design_rtx5070_l2.md)
+    if (!store) l2::setup(*this);
 }
 
 void Model::choose_residency() {
@@ -1595,7 +1943,7 @@ void card_fields(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
 }
 #if !FNX_27B   // the 27B has no holder (plain loads only)
-static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
+static_assert(sizeof(CardW) == 944, "CardW changed: put what load_card stores in card_fields, then update this size");
 #endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>
