@@ -874,6 +874,7 @@ __device__ __forceinline__ float ring_x(const float* x, const RingMoe& m, int T,
 #pragma unroll
     for (int k = 0; k < TOPK; ++k) s = fmaf(m.topw[t * TOPK + k], m.part[((size_t) t * TOPK + k) * N + i], s);
     if (m.add) s += m.add[(size_t) t * N + i];   // the rows of the experts a tier card ran (l2_pf.hpp)
+    else if (m.add_h) s += __half2float(m.add_h[(size_t) t * N + i]);   // the same rows as f16 (FNX_L2_PF_FP16)
     return fmaf(sigm(m.logits[(size_t) t * (NEXP + 1) + NEXP]), m.part[((size_t) T * TOPK + t) * N + i], s);
 }
 __device__ __forceinline__ float2 ring_x2(const float* x, const RingMoe& m, int T, int t, int p) {
@@ -2060,10 +2061,9 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
     }();
     int dev = 0;
     cudaGetDevice(&dev);
-    // which prompt GDN scan a card really runs, once per card and without FNX_PF_TIMING: on sm_75 the sub-chunk scan's
-    // dynamic shared memory (GCH_REC_SMEM) is over what a Turing block may opt into, so every prompt takes the
-    // row-by-row kernel however FNX_PF_GDN_CHUNK is set (measured, not assumed)
-    auto report_gdn = [&](bool chunk, const char* why) {
+    // which prompt GDN scan a card really runs, once per card and without FNX_PF_TIMING: the scan's dynamic shared
+    // memory says it, because a block may only opt into what its own card allows (measured, not assumed)
+    auto report_gdn = [&](bool chunk, int gcb, size_t need, const char* why) {
         static int done[16] = {};
         if (dev < 0 || dev >= 16 || done[dev]) return;
         done[dev] = 1;
@@ -2075,25 +2075,42 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
         std::fprintf(stderr,
                      "fnx: prompt GDN path: card %d sm_%d%d, %s, scan %s: sub-chunk needs %zu B of dynamic shared memory, "
                      "a block here takes %d B (opt-in up to %d B)\n",
-                     dev, cc_maj, cc_min, why, chunk ? "sub-chunk k_gdn_ch_rec" : "row-by-row k_gdn_pf_rec", GCH_REC_SMEM,
+                     dev, cc_maj, cc_min, why,
+                     chunk ? (gcb == 16 ? "sub-chunk k_gdn_ch_rec<16>" : "sub-chunk k_gdn_ch_rec<32>") : "row-by-row k_gdn_pf_rec",
+                     need,
                      smem_block, smem_optin);
     };
-    bool use_chunked = chunked;
+    int rec_gcb = 32;
+    size_t rec_smem = gch_rec_smem_t<32>;
+    // FNX_GDN_FORCE_REC=1: the row-by-row kernel whatever the card can do (the switch this line is the escape for)
+    static const bool force_rec = fnx::env_int("FNX_GDN_FORCE_REC", 0) != 0;
+    bool use_chunked = chunked && !force_rec;
     if (use_chunked) {
-        static thread_local int smem_ok[16] = {};
-        if (smem_ok[dev] == 0) {
-            if (cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM) != cudaSuccess) {
-                cudaGetLastError(); // Clear invalid argument on sm_75 (64KB smem limit) and fall back to k_gdn_pf_rec
-                smem_ok[dev] = -1;
-            } else {
-                smem_ok[dev] = 1;
+        // Which column width this card's blocks may take, once per card: 32 where the card allows its dynamic shared
+        // memory, otherwise 16 (57,988 B, the width the gfx12 build has always used), otherwise the row-by-row kernel.
+        // Refusing the 32-column ask used to drop the chunk path whole on sm_75, so both widths are tried before the
+        // chunk is given up (gdn_prompt.cuh:259-266).
+        static thread_local int picked[16] = {};
+        if (picked[dev] == 0) {
+            if (cudaFuncSetAttribute(k_gdn_ch_rec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gch_rec_smem_t<32>) == cudaSuccess)
+                picked[dev] = 32;
+            else {
+                cudaGetLastError();   // the refused 74,372 B ask is not an error the 16-column ask should inherit
+                if (cudaFuncSetAttribute(k_gdn_ch_rec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gch_rec_smem_t<16>) == cudaSuccess)
+                    picked[dev] = 16;
+                else {
+                    cudaGetLastError();   // a card under 58 KB of opt-in: the row-by-row kernel, as before
+                    picked[dev] = -1;
+                }
             }
         }
-        if (smem_ok[dev] < 0) use_chunked = false;
+        if (picked[dev] == 16) rec_gcb = 16, rec_smem = gch_rec_smem_t<16>;
+        else if (picked[dev] < 0) rec_gcb = 0, use_chunked = false;
     }
-    if (!chunked) report_gdn(false, "FNX_PF_GDN_CHUNK=0");
-    else if (!use_chunked) report_gdn(false, "FNX_PF_GDN_CHUNK=1 refused by this card");
-    else report_gdn(true, "FNX_PF_GDN_CHUNK=1");
+    if (!chunked) report_gdn(false, rec_gcb, gch_rec_smem_t<32>, "FNX_PF_GDN_CHUNK=0");
+    else if (force_rec) report_gdn(false, rec_gcb, gch_rec_smem_t<32>, "FNX_GDN_FORCE_REC=1");
+    else if (!use_chunked) report_gdn(false, rec_gcb, rec_smem, "FNX_PF_GDN_CHUNK=1 refused by this card");
+    else report_gdn(true, rec_gcb, rec_smem, "FNX_PF_GDN_CHUNK=1");
     if (use_chunked) {
         // FNX_PF_GDN_CHECK=1 (debugging): the row-by-row kernel on the same inputs first, then how far the sub-chunk
         // path's outputs and end state are from its (largest difference over the largest value)
@@ -2113,7 +2130,8 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
             cudaFree(s0), cudaFree(yr);
         }
         k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
-        k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        if (rec_gcb == 16) k_gdn_ch_rec<16><<<nv * gch_rec_blocks_t<16>, gcr_threads_t<16>, gch_rec_smem_t<16>, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        else k_gdn_ch_rec<32><<<nv * gch_rec_blocks_t<32>, gcr_threads_t<32>, gch_rec_smem_t<32>, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
         if (check) {
             std::vector<float> y(ny), sn(ns);
             cudaMemcpyAsync(y.data(), y32, ny * 4, cudaMemcpyDeviceToHost, s);
@@ -2177,6 +2195,29 @@ size_t gdn_prompt_work_floats(int C, int nv) { return (size_t) ((C + GCH - 1) / 
 
 namespace fnx {
 #if FNX_KPART == 8
+// One worker's rows, copied into part: the (m, s) walk its answer is laid out in. Every number here comes out of
+// mapped host memory that the card's next layer and both workers keep rewriting, and a captured graph replays this
+// kernel after the CPU has run further ahead still, so none of it is trusted. A count, a pair row or a slot outside
+// the lists is skipped, which is what a worker that cannot answer a round answers it with anyway (zero), and it is
+// what keeps a bad value from writing outside the rows of part the pairs own (measured: an MMU write fault on a
+// Turing card, Xid 31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE, with this kernel the only new writer there).
+__device__ __forceinline__ void merge_rows(float* part, const float* src, int n, const int* n_list, const int* out_list) {
+    constexpr int LIM = MAXT * TOPK;   // the lists' width, and part's rows before the shared expert's at part + P * N
+    int slots = 0;
+    for (int m = 0; m < n && m < LIM && slots < LIM; ++m) {
+        const int mn = n_list[m];
+        if (mn <= 0 || mn > MAXT) continue;
+        for (int s = 0; s < mn && slots + s < LIM; ++s) {
+            const unsigned int out_slot = (unsigned int) out_list[(size_t) m * MAXT + s];
+            if (out_slot >= (unsigned int) LIM) continue;
+            const float* from = src + (size_t) (slots + s) * N;
+            float* to = part + (size_t) out_slot * N;
+            for (int i = threadIdx.x; i < N; i += 256) to[i] = from[i];
+        }
+        slots += mn;
+    }
+}
+
 __global__ void __launch_bounds__(256) k_cpu_moe_merge(CpuMoeBox* box, float* part) {
     if (!box) return;
     if (threadIdx.x == 0 && blockIdx.x == 0) {
@@ -2187,23 +2228,24 @@ __global__ void __launch_bounds__(256) k_cpu_moe_merge(CpuMoeBox* box, float* pa
             }
             __threadfence_system();
         }
+        // rev.15-M2b-2: the tier card's rows, on a counter of their own. Each answer counts the same req_seq bumps, so
+        // a round whose picks went to the tier never waits on the host worker and the other way round; a layer with
+        // neither pays no wait at all, which is what keeps a captured graph replayable on a tier-less run.
+        if (box->n_l2 > 0) {
+            const unsigned long long target = box->req_seq;
+            while (*(volatile const unsigned long long*) &box->l2_done_seq < target) {
+                __nanosleep(64);
+            }
+            __threadfence_system();
+        }
     }
     __syncthreads();
-    const int n_miss = box->n_miss;
-    if (n_miss <= 0) return;
-    int total_slots = 0;
-    for (int m = 0; m < n_miss; ++m) {
-        const int mn = box->miss_n[m];
-        for (int s = 0; s < mn; ++s) {
-            const int out_slot = box->miss_out[m][s];
-            const float* src = box->y_out + (size_t) (total_slots + s) * N;
-            float* dst = part + (size_t) out_slot * N;
-            for (int i = threadIdx.x; i < N; i += 256) {
-                dst[i] = src[i];
-            }
-        }
-        total_slots += mn;
-    }
+    const int n_miss = box->n_miss, n_l2 = box->n_l2;
+    if (n_miss <= 0 && n_l2 <= 0) return;
+    merge_rows(part, box->y_out, n_miss, box->miss_n, &box->miss_out[0][0]);
+    // the tier's rows, in the order its worker built them (the same walk of the box, so the same row for the same
+    // pick). Rows the worker left unwritten it zeroed, so a tier that failed lands as a zero and not as a NaN.
+    merge_rows(part, box->l2_y_out, n_l2, box->l2_n, &box->l2_out[0][0]);
 }
 
 void cpu_moe_merge(CpuMoeBox* d_cpu_box, float* part, void* st) {
@@ -2214,7 +2256,7 @@ void cpu_moe_merge(CpuMoeBox* d_cpu_box, float* part, void* st) {
 
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out, CpuMoeBox* d_cpu_box) {
+                  float* sh_out, CpuMoeBox* d_cpu_box, const char* l2_map, const void* xq_rows, int l2_cap) {
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2231,7 +2273,12 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     unsigned* counter = (unsigned*) (njobs + 1);
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, d_cpu_box)
+    // a tier that cannot be sent this card's activation rows is a tier with no picks: without them it would compute
+    // the wrong rows, and dropping the map instead leaves every pick on the paths that can answer it (l2_dec.hpp)
+    if (l2_map && !xq_rows) l2_map = nullptr;
+#define FNX_RR(t) \
+    k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, \
+                                                  d_cpu_box, l2_map, (const unsigned char*) xq_rows, l2_cap)
     switch (T) {
         case 1: FNX_RR(1); break;
         case 2: FNX_RR(2); break;

@@ -6,6 +6,7 @@
 #include "env.hpp"
 #include "peer_probe.hpp"
 #include "pf_pick.hpp"
+#include "l2_dec.hpp"
 
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -32,6 +33,11 @@
 
 namespace fnx {
 
+// One kernel, one word: it writes the last word of the mapped page-locked CpuMoeBox. A card that cannot reach the
+// tail of that mapping says so here, at start-up and under its own stage name, instead of a second later inside the
+// first verify window (both Turing cards' Xid 31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE could only be told apart by which
+// writer and which word they touched). One launch and one sync per card, before anything is captured.
+__global__ void k_box_tail(float* last) { *last = 1.0f; }
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_ctx, (int) env_int("FNX_MAX_CTX", 32768))) {
     max_ctx = max_ctx_;
@@ -325,9 +331,33 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
         if (env_int("FNX_CPU_MOE", 0) != 0 && !w.cpu_host_gu.empty()) {
             CpuMoeBox* hbox = nullptr;
             CpuMoeBox* dbox = nullptr;
-            ck(cudaHostAlloc((void**) &hbox, sizeof(CpuMoeBox), cudaHostAllocMapped), "cpu_box alloc");
+            // Portable as well as Mapped: the tier card's worker reads this box's rows and answers into it from its
+            // own context (l2_dec.cu), and a mapped allocation without Portable belongs to the card that made it
+            // Page-locked memory reaches a card through the driver's own page tables, and those are laid out 2 MiB
+            // (one page directory entry) at a time. A request that neither starts on nor rounds to that boundary
+            // leaves the end of the struct in an entry of its own, and a kernel write there is an MMU fault rather
+            // than a wrong number. M2b-2 grew the box past the first 2 MiB with the tier's lists, and both Turing
+            // cards faulted writing it (Xid 31, ACCESS_TYPE_VIRT_WRITE) on the first window. So: whole 2 MiB blocks,
+            // aligned to one, plus a block of slack past the end. The struct never needs that slack; it only makes
+            // the mapping cover whole entries. The extra block also carries the alignment the raw pointer loses.
+            constexpr size_t PDE = (size_t) 2 << 20;
+            const size_t box_span = ((sizeof(CpuMoeBox) + PDE - 1) / PDE) * PDE;
+            void* box_raw = nullptr;
+            ck(cudaHostAlloc(&box_raw, box_span + PDE, cudaHostAllocMapped | cudaHostAllocPortable), "cpu_box alloc");
+            b->cpu_box_raw = box_raw;
+            b->cpu_box_bytes = box_span + PDE;
+            hbox = (CpuMoeBox*) (((size_t) box_raw + (PDE - 1)) & ~(PDE - 1));
             std::memset(hbox, 0, sizeof(CpuMoeBox));
             ck(cudaHostGetDevicePointer((void**) &dbox, (void*) hbox, 0), "cpu_box dev ptr");
+            // ... and prove the tail of that mapping by writing it, so the answer to "does a card own its whole box"
+            // comes out at start-up (it costs one launch); the word goes back to zero for the rounds that follow.
+            float* tail = nullptr, *tail_host = &hbox->l2_y_out[sizeof(hbox->l2_y_out) / sizeof(float) - 1];
+            ck(cudaHostGetDevicePointer((void**) &tail, (void*) tail_host, 0), "cpu_box tail ptr");
+            k_box_tail<<<1, 1, 0, b->st>>>(tail);
+            ck(cudaStreamSynchronize(b->st), "cpu_box tail poke");
+            *tail_host = 0.f;
+            std::fprintf(stderr, "fnx: cpu_box: card %d host %p dev %p size %zu mapped %zu, tail poke ok%c", c, (void*) hbox, (void*) dbox,
+                         sizeof(CpuMoeBox), box_span + PDE, 10);
             b->cpu_box = hbox;
             b->d_cpu_box = dbox;
             // the workers are barrier-synced, so more of them than the CPUs this box allows (cgroup quota, the affinity
@@ -349,6 +379,10 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
             static_assert(4 * (size_t) FF_CARD_MAX <= HQ_BYTES_MAX, "a shared h row must hold the widest FF slice activation");
             static_assert(sizeof(((const CpuMoeBox*) nullptr)->miss_w) / sizeof(int) == (size_t) MAXT * TOPK,
                           "the slot table sizes the box's miss list");
+            static_assert(sizeof(((const CpuMoeBox*) nullptr)->l2_w) / sizeof(int) == (size_t) MAXT * TOPK,
+                          "the tier's pick list must be as wide as the slot's");
+            static_assert(sizeof(((const CpuMoeBox*) nullptr)->x_q8) == (size_t) MAXT * q8_1_bytes(N),
+                          "the tier must be handed the card's own activation bytes");
             for (int ll = 0; ll < NL; ++ll) {
                 std::string ferr;
                 strata::ds4::gguf::IqCpu f;
@@ -490,7 +524,15 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
                     }
                 }).detach();
             }
-            std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, n_threads, GU_STEP, DN_STEP]() {
+            // The tier card's worker beside the host one (l2_dec.hpp). The router sorted this window's picks three ways,
+            // so the cards, the tier and the host worker each answer a disjoint part of the same window at the same
+            // time; opening it here, per card, is what hands this card's box to that worker. False keeps decode exactly
+            // as it was: no extra kernel, no extra event, no extra thread.
+            const bool l2_dec_on = l2::dec::open(c, m, hbox);
+            tpopt::WaitSlot* l2dec_wake = l2_dec_on ? l2::dec::wake() : nullptr;
+            b->l2_dec_on = l2_dec_on;
+            b->l2_dec_map = l2_dec_on ? l2::dec::map(c) : nullptr;
+            std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, n_threads, GU_STEP, DN_STEP, l2dec_wake]() {
                 unsigned long long last_seq = 0;
                 tpopt::HotWait mgr_wait;
                 while (true) {
@@ -505,6 +547,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
                     }
                     mgr_wait.reset();
                     std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (l2dec_wake)
+                        tpopt::publish(*l2dec_wake);   // the tier's worker waits on a slot only this thread can reach
                     const int n_miss = std::min(std::max(hbox->n_miss, 0), MAXT * TOPK);   // the slot table's capacity
                     const int l = hbox->layer;
                     const int T_cur = std::max(1, std::min(MAXT, hbox->T));
@@ -1239,7 +1283,8 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     const bool live = cache_live() && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, b.d_cpu_box);
+                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, b.d_cpu_box,
+                 b.l2_dec_map, b.l2_dec_on ? b.xq : nullptr, l2::dec::cap());
     if (const int l = lyr; l >= 0 && l < NL) {
         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);

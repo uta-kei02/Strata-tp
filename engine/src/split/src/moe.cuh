@@ -131,7 +131,8 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
                                                             const ExpertCache ec, int layer, int* list, const ShexpUp su,
-                                                            CpuMoeBox* d_cpu_box) {
+                                                            CpuMoeBox* d_cpu_box, const char* __restrict__ l2_map,
+                                                            const unsigned char* __restrict__ xq_rows, int l2_cap) {
     static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
     constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;   // float4 chunks per lane
     const int nrr = (int) gridDim.x - su.blocks;              // the router's own blocks; the shared expert's after them
@@ -204,6 +205,12 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
                 const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
+            // A row whose logits are all NaN (or all -inf) never wins a comparison, so the sentinel survives the
+            // reduce. Kept as-is it indexes one past the shared arrays below: firstpair[NEXP] lands on slots[0],
+            // jobof[NEXP] reads whatever follows, and the wild job index that comes out of it writes gu[j] outside
+            // shared memory -- the write the two Turing cards faulted on (Xid 31, FAULT_PDE ... VIRT_WRITE).
+            // Clamping to expert 0 changes only a row that is already garbage; a normal row always has bi < NEXP.
+            if (bi >= NEXP) bi = 0;
             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
             if (k == 0) top0 = bv;
             const float ek = __expf(bv - top0);
@@ -253,7 +260,10 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
         *counter = 0u;
     }
     if (!ec.n_slots) {
-        if (d_cpu_box && e == 0) d_cpu_box->n_miss = 0;
+        if (d_cpu_box && e == 0) {
+            d_cpu_box->n_miss = 0;
+            d_cpu_box->n_l2 = 0;   // both counters are always this launch's answer, never last round's
+        }
         return;
     }
     __syncthreads();
@@ -261,10 +271,16 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
     if (!d_cpu_box) return;
     __syncthreads();
     // Separate VRAM-resident jobs (for GPU) vs RAM-resident misses (for CPU Hybrid TP worker) in-place
-    __shared__ int s_n_miss;
+    __shared__ int s_n_miss, s_n_l2;
     if (e == 0) {
-        int g_cnt = 0, m_cnt = 0;
+        int g_cnt = 0, m_cnt = 0, l_cnt = 0;
         const int base = layer * NEXP;
+        // rev.15-M2b-2: a pick with no slot on this card but resident in the tier card's arena goes to the tier
+        // instead of the host worker (l2_dec.hpp). The order is the card's slot, then the arena, then host RAM, and a
+        // pick lands in exactly one of the three: what this drops from the card's jobs (njobs[0] = g_cnt) is answered
+        // by exactly one of the other two, so the ring still sums each pair once.
+        const bool tier_on = l2_map && layer >= 0 && layer < NL;
+        const int lcap = (l2_cap > 0 && l2_cap < P) ? l2_cap : P;
         for (int j = 0; j < nj; ++j) {
             const Job jb_gu = gu[j];
             const Job jb_dn = dn[j];
@@ -275,6 +291,17 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
                     dn[g_cnt] = jb_dn;
                 }
                 ++g_cnt;
+            } else if (tier_on && l_cnt < lcap && jb_gu.n > 0 && jb_gu.n <= MAXT && l2_map[base + w]) {
+                // the job's shape is checked here as well: what goes to the tier lands in the box's [l2][MAXT] rows,
+                // so a job wider than the box stays with the cards and the host worker rather than being written past
+                // the end of one of its lists
+                d_cpu_box->l2_w[l_cnt] = w;
+                d_cpu_box->l2_n[l_cnt] = jb_gu.n;
+                for (int s = 0; s < jb_gu.n; ++s) {
+                    d_cpu_box->l2_y[l_cnt][s] = jb_gu.y[s];
+                    d_cpu_box->l2_out[l_cnt][s] = jb_gu.out[s];
+                }
+                ++l_cnt;
             } else {
                 d_cpu_box->miss_w[m_cnt] = w;
                 d_cpu_box->miss_n[m_cnt] = jb_gu.n;
@@ -286,22 +313,37 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
             }
         }
         s_n_miss = m_cnt;
+        s_n_l2 = l_cnt;
         njobs[0] = g_cnt;
         d_cpu_box->layer = layer;
         d_cpu_box->T = T;
         d_cpu_box->n_miss = m_cnt;
+        d_cpu_box->n_l2 = l_cnt;
     }
     __syncthreads();
     if (s_n_miss > 0) {
         for (int i = e; i < T * N; i += RR_THREADS) {
             d_cpu_box->x_in[i] = x[i];
         }
-        __syncthreads();
-        if (e == 0) {
-            __threadfence_system();
-            d_cpu_box->req_seq = d_cpu_box->req_seq + 1ULL;
-            __threadfence_system();
+    }
+    // The tier reads this card's activation rows as they already stand (q8_1), which is what lets it run the very
+    // gate|up and down kernels the cards run on the same bytes; only the window's rows, and only for a round that
+    // has picks of its own. The rows and the misses are both written before the single counter bump below, so a
+    // worker woken by that counter sees both lists whole.
+    __syncthreads();
+    if (s_n_l2 > 0 && xq_rows) {
+        constexpr int WROW = (int) (q8_1_bytes(N) / 4);   // one activation row, as words
+        const unsigned* src = reinterpret_cast<const unsigned*>(xq_rows);
+        unsigned* dst = reinterpret_cast<unsigned*>(&d_cpu_box->x_q8[0]);
+        for (int i = e; i < T * WROW; i += RR_THREADS) {
+            dst[i] = src[i];
         }
+    }
+    __syncthreads();
+    if ((s_n_miss > 0 || s_n_l2 > 0) && e == 0) {
+        __threadfence_system();
+        d_cpu_box->req_seq = d_cpu_box->req_seq + 1ULL;
+        __threadfence_system();
     }
 }
 

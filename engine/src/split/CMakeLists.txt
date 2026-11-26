@@ -73,7 +73,8 @@ endif()
 set(_sp ${CMAKE_CURRENT_SOURCE_DIR})
 set(_sp_engine
     ${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/store.cpp ${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu
-  ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/l2_offload.cu ${_sp}/src/l2_pf.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
+  ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/l2_offload.cu ${_sp}/src/l2_pf.cu ${_sp}/src/l2_dec.cu
+  ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
 if(_fnx_hip)
   list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp)
 endif()
@@ -86,7 +87,7 @@ set_source_files_properties(${_sp}/src/gguf.cpp ${_sp}/src/model.cpp ${_sp}/src/
                             ${_sp}/tools/sfnx.cpp PROPERTIES LANGUAGE ${_fnx_lang})
 if(_fnx_hip)
   set_source_files_properties(${_sp}/src/moe_mma.cu ${_sp}/src/engine.cu ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu
-    ${_sp}/src/l2_offload.cu ${_sp}/src/l2_pf.cu ${_sp}/src/selftest.cu PROPERTIES LANGUAGE HIP)
+    ${_sp}/src/l2_offload.cu ${_sp}/src/l2_pf.cu ${_sp}/src/l2_dec.cu ${_sp}/src/selftest.cu PROPERTIES LANGUAGE HIP)
 endif()
 # kernels.cu is compiled in nine parts (FNX_KPART), each with its share of the launchers, so the build runs in parallel
 set(_sp_kparts "")

@@ -46,7 +46,13 @@ int main(int argc, char** argv) {
     cudaDeviceProp pr{};
     CK(cudaGetDeviceProperties(&pr, dev));
     std::printf("card %s (sm_%d%d, %d SMs), a slice of %d key heads and %d value heads\n", pr.name, pr.major, pr.minor, pr.multiProcessorCount, nk, nv);
-    CK(cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM));
+    // the same width pick the engine makes (kernels.cu:2091-2105): 32 state columns where the card allows them, else 16
+    int rec_gcb = 32;
+    if (cudaFuncSetAttribute(k_gdn_ch_rec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gch_rec_smem_t<32>) != cudaSuccess) {
+        cudaGetLastError();
+        CK(cudaFuncSetAttribute(k_gdn_ch_rec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) gch_rec_smem_t<16>));
+        rec_gcb = 16;
+    }
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
     std::vector<int> vmap(nv);
@@ -82,7 +88,10 @@ int main(int argc, char** argv) {
             CK(cudaMemcpy(d_S0, S0.data(), ns * 4, cudaMemcpyHostToDevice));
             auto run_old = [&] {
                 k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(d_xc, d_ab, d_dt, d_a, d_vmap, nk, nv, C, d_chw);
-                k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(d_xc, d_chw, d_S, d_y0, nk, nv, d_vmap, C);
+                if (rec_gcb == 16)
+                    k_gdn_ch_rec<16><<<nv * gch_rec_blocks_t<16>, gcr_threads_t<16>, gch_rec_smem_t<16>, s>>>(d_xc, d_chw, d_S, d_y0, nk, nv, d_vmap, C);
+                else
+                    k_gdn_ch_rec<32><<<nv * gch_rec_blocks_t<32>, gcr_threads_t<32>, gch_rec_smem_t<32>, s>>>(d_xc, d_chw, d_S, d_y0, nk, nv, d_vmap, C);
             };
             auto run_new = [&]() -> bool { return gdn_tc_run(d_xc, d_ab, d_dt, d_a, d_S, d_y1, nk, nv, d_vmap, C, s); };
             CK(cudaMemcpy(d_S, d_S0, ns * 4, cudaMemcpyDeviceToDevice));

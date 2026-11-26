@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>   // rev.15-M2b-1w: RingMoe's addend rows may be f16 (l2_pf.hpp)
 
 #include <cstddef>
 #include <cstdint>
@@ -289,6 +290,9 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 struct CpuMoeBox {
     volatile unsigned long long req_seq;
     volatile unsigned long long done_seq;
+    // rev.15-M2b-2: the tier card's answer (l2_dec.hpp). Its own sequence, so a round whose picks the tier ran never
+    // waits on the host worker's counter and the other way round; both count the same req_seq bumps.
+    volatile unsigned long long l2_done_seq;
     int layer;
     int T;
     int n_miss;
@@ -298,11 +302,23 @@ struct CpuMoeBox {
     int miss_out[MAXT * TOPK][MAXT];
     alignas(16) float x_in[MAXT * N];
     alignas(16) float y_out[MAXT * TOPK * N];
+    // the picks the router sent to the expert tier instead of the host worker, in the same shape: n_l2 of them, the
+    // tier computing them from the arena and answering into l2_y_out in the order (m, s) the merge walks. x_q8 is
+    // this card's activation rows as they already are on the card (q8_1), copied once per round that has picks, so
+    // the tier runs the same IQ3_S kernels the cards do on the same activation bytes.
+    int n_l2;
+    int l2_w[MAXT * TOPK];
+    int l2_n[MAXT * TOPK];
+    int l2_y[MAXT * TOPK][MAXT];
+    int l2_out[MAXT * TOPK][MAXT];
+    alignas(16) unsigned char x_q8[MAXT * q8_1_bytes(N)];   // the card's own activation rows, q8_1, same bytes as CardBuf::xq
+    alignas(16) float l2_y_out[MAXT * TOPK * N];
 };
 
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
-                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, CpuMoeBox* d_cpu_box = nullptr);
+                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, CpuMoeBox* d_cpu_box = nullptr,
+                  const char* l2_map = nullptr, const void* xq_rows = nullptr, int l2_cap = 0);
 void cpu_moe_merge(CpuMoeBox* d_cpu_box, float* part, void* st);
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
@@ -342,6 +358,9 @@ struct RingMoe {
     // rev.15-M2b-1: the part of this card's addend an expert tier computed instead (l2_pf.hpp). Null: the cards run
     // every expert themselves, which is what they did before it existed.
     const float* add = nullptr;
+    // rev.15-M2b-1w: the same rows as f16, half the bytes over the host relay (FNX_L2_PF_FP16). Set with `add` left
+    // null, so a consumer reads one width only and the f32 path stays bit for bit what it was.
+    const __half* add_h = nullptr;
 };
 
 // the sum across the cards (ring; words of two fp16 values and a tag); bufs are this card's receive buffers, peers'

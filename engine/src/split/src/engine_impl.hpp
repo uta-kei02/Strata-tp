@@ -42,6 +42,14 @@ struct CardBuf {
     Job *jobs_gu, *jobs_dn, *dense[MAXT + 1];
     CpuMoeBox* cpu_box = nullptr;
     CpuMoeBox* d_cpu_box = nullptr;
+    // the page-locked block the box sits inside: cudaHostAlloc's own pointer, which is not the box's (the box is
+    // aligned up to a 2 MiB page directory entry so a card's write can never reach past what the driver mapped)
+    void* cpu_box_raw = nullptr;
+    size_t cpu_box_bytes = 0;
+    // rev.15-M2b-2 (l2_dec.hpp): the tier card's pick map, in this card's memory, and whether its worker answers this
+    // card at all. The router reads the map on the card, so it costs nothing when null.
+    const char* l2_dec_map = nullptr;
+    bool l2_dec_on = false;
     float *gu, *part;
     float* sh_gu;                     // the shared expert: [T][gate | up]
     void* sh_hq;                      // its h as q8_1

@@ -1038,6 +1038,19 @@ void check_route_env() {
         throw std::runtime_error("FNX_ROUTE_TRACE needs FNX_ROUTE_TRACE_FILE");
 }
 
+// CUDA_LAUNCH_BLOCKING=1 (measured: it hung this engine at ncclCommInitAll, then hung the service that came back up
+// because the variable was inherited). A blocking launch does not return until the kernel is done, and here the
+// cards wait on each other's streams, on the host's counters and on a graph launch's return, so nothing gets done:
+// refusing it is cheaper than the minute it costs to find out the slow way. Only an empty value or 0 is accepted.
+void check_launch_blocking() {
+    const char* v = std::getenv("CUDA_LAUNCH_BLOCKING");
+    if (!v || !v[0] || std::atoi(v) == 0) return;
+    throw std::runtime_error(std::string("CUDA_LAUNCH_BLOCKING=") + v +
+                             ": a blocking launch cannot run this engine (the TP ring, the tier's answers and the verify "
+                             "windows all wait on work other streams and the host raise, so it deadlocks). Unset it, or "
+                             "set it to 0");
+}
+
 // SFNX_TEST_PROMPT replaces every text request's tokens: it starts only beside SFNX_TEST_PROMPT_CONFIRM=1, so the one
 // variable leaking into a service's environment cannot turn every answer into the test prompt's
 void check_test_prompt() {
@@ -1118,6 +1131,7 @@ void load_dflash2(fnx::df2::Bridge& br, const fnx::Model& m, const Args& a) {
 int main(int argc, char** argv) {
     Args a;
     try {
+        check_launch_blocking();
         a = parse_args(argc, argv);
         check_route_env();
         check_test_prompt();
