@@ -29,6 +29,25 @@ constexpr size_t MAX_CKPTS = 6;     // checkpoints kept per conversation
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
+// FNX_PF_TIMING=1: a prompt read phase by phase (where the fixed cost of an almost-reused prompt goes)
+bool pf_timing() {
+    static const bool on = env_flag("FNX_PF_TIMING");
+    return on;
+}
+double mib_of(size_t bytes) { return (double) bytes / (1024.0 * 1024.0); }
+// the host memory one conversation costs: its whole state plus its checkpoints (what the cache budget counts)
+size_t conv_bytes(const CachedConv& c) {
+    size_t t = c.kv ? c.kv->total() : 0;
+    for (const std::shared_ptr<Engine::SeqState>& s : c.ckpts) t += s->total();
+    return t;
+}
+// one phase's wall clock, added to `to` also when the phase throws (a Refused read still reports what it spent)
+struct PhaseTime {
+    double& to;
+    const std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    explicit PhaseTime(double& out) : to(out) {}
+    ~PhaseTime() { to += ms_since(t); }
+};
 }  // namespace
 
 double Dist::prob(int id) const {
@@ -160,6 +179,8 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
     const int n = (int) prompt.size();
     const size_t body = (size_t) n - 1;   // the tokens the engine is to hold before generate()
     const bool caching = cache_->budget > 0 && hints.cache;
+    // FNX_PF_TIMING=1: where the wall clock of a read goes, phase by phase (the fixed cost of an almost-reused prompt)
+    double ms_state = 0, ms_park = 0, ms_root = 0, ms_pre = 0, ms_ckpt = 0, ms_ev = 0;
     // how much of a conversation the prompt can start from: all of it when the prompt extends it, else its longest
     // checkpoint inside the shared prefix (ck: that checkpoint, -1 for all)
     auto usable = [&](const std::vector<int>& toks, const std::vector<State>& ckpts, int& ck) -> size_t {
@@ -191,13 +212,16 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
     }
     // the live sequence goes to host memory when the prompt leaves most of it (another conversation)
     auto park_live = [&] {
-        if (caching) park_live_();
+        if (!caching) return;
+        const PhaseTime ph{ms_park};
+        park_live_();
     };
     if (from_parked > from_live) {
         park_live();
         Conv c = std::move(cache_->parked[(size_t) best_parked]);
         cache_->parked.erase(cache_->parked.begin() + best_parked);
         const auto t_load = std::chrono::steady_clock::now();
+        const size_t want = conv_bytes(c);   // what this conversation costs the budget, before it becomes the live one
         try {
             e_.load_state(*c.kv);
         } catch (const Refused&) {   // no pages for it: the lane holds what it held, and the conversation stays parked
@@ -207,10 +231,12 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
         if (ck_parked >= 0) e_.load_state(*c.ckpts[(size_t) ck_parked]);
         c.kv.reset();
         live_ = std::move(c);
-        std::fprintf(stderr, "conversation cache: restored %zu tokens in %.0f ms, parked=%zu bytes=%zu\n", from_parked, ms_since(t_load),
-                     cache_->parked.size(), bytes_held());
+        std::fprintf(stderr, "conversation cache: restored %zu tokens in %.0f ms, %.1f MiB loaded, parked=%zu held=%.1f MiB of %.1f MiB\n",
+                     from_parked, ms_since(t_load), mib_of(want), cache_->parked.size(), mib_of(bytes_held()), mib_of(cache_->budget));
+        ms_state += ms_since(t_load);
     } else if (from_live < hist.size()) {
         if (from_live * 2 < hist.size() || hist.size() - from_live >= DROP_PARK_MIN) park_live();
+        const PhaseTime ph{ms_state};
         if (ck_live >= 0) {
             e_.load_state(*live_.ckpts[(size_t) ck_live]);
         } else {
@@ -253,6 +279,7 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
     size_t pos = at;
     for (size_t end : cps) {
         if (end > pos) {
+            const PhaseTime ph{ms_pre};
             std::vector<int> seg(prompt.begin() + pos, prompt.begin() + end);
             e_.on_prefill_chunk = [&, pos](int done) {
                 if (progress) progress((int) pos + done, n);
@@ -279,16 +306,32 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
                 c.len = root;
                 c.used = ++cache_->clock;
                 cache_->parked.push_back(std::move(c));
-                std::fprintf(stderr, "conversation cache: the first message (%zu tokens) parked on its own with %zu checkpoints inside, in %.0f ms\n",
-                             root, cache_->parked.back().ckpts.size(), ms_since(t_root));
+                std::fprintf(stderr,
+                             "conversation cache: the first message (%zu tokens) parked on its own with %zu checkpoints inside, in %.0f ms, "
+                             "conv=%.1f MiB: held %.1f MiB of %.1f MiB\n",
+                             root, cache_->parked.back().ckpts.size(), ms_since(t_root), mib_of(conv_bytes(cache_->parked.back())),
+                             mib_of(bytes_held()), mib_of(cache_->budget));
+                ms_root += ms_since(t_root);
             }
         }
-        checkpoint(live_);
+        {
+            const PhaseTime ph{ms_ckpt};
+            checkpoint(live_);
+        }
     }
     live_.len = body;
-    evict(0);
+    {
+        const PhaseTime ph{ms_ev};
+        evict(0);
+    }
     prompt_ = prompt;
     st.prompt_ms = ms_since(t0);
+    if (pf_timing())
+        std::fprintf(stderr,
+                     "fnx: prompt phases: %d tokens = %d reused + %d read in %.1f ms: state %.1f ms, park %.1f ms, first-message park %.1f ms, "
+                     "prefill %.1f ms, checkpoint %.1f ms, evict %.1f ms, held %.1f MiB of %.1f MiB, parked %zu\n",
+                     n, (int) at, n - (int) at, st.prompt_ms, ms_state, ms_park, ms_root, ms_pre, ms_ckpt, ms_ev,
+                     mib_of(bytes_held()), mib_of(cache_->budget), cache_->parked.size());
 }
 
 void Session::checkpoint(Conv& c) {
@@ -319,8 +362,10 @@ void Session::park_live_() {
     c.len = hist.size();
     c.used = live_.used;
     cache_->parked.push_back(std::move(c));
-    std::fprintf(stderr, "conversation cache: parked %zu tokens in %.0f ms, parked=%zu bytes=%zu\n", hist.size(), ms_since(t_park),
-                 cache_->parked.size(), bytes_held());
+    std::fprintf(stderr,
+                 "conversation cache: parked %zu tokens in %.0f ms, conv=%.1f MiB, parked=%zu held=%.1f MiB of %.1f MiB\n",
+                 hist.size(), ms_since(t_park), mib_of(conv_bytes(cache_->parked.back())), cache_->parked.size(),
+                 mib_of(bytes_held()), mib_of(cache_->budget));
 }
 
 void Session::park() {
@@ -348,15 +393,23 @@ void Session::reload(const Engine::SeqState& s) {
     live_.used = ++cache_->clock;
 }
 
-// least recently used parked conversations out until the held states and `need` more fit the budget
+// least recently used parked conversations out until the held states and `need` more fit the budget, and until what is
+// parked fits the cache's slots: with more clients taking turns than --conversation-cache-slots, the oldest parked
+// conversation leaves and that client reads its whole prompt again when it comes back
 void Session::evict(size_t need) {
-    while (bytes_held() + need > cache_->budget && !cache_->parked.empty()) {
+    while ((bytes_held() + need > cache_->budget || (cache_->slots > 0 && cache_->parked.size() > cache_->slots)) &&
+           !cache_->parked.empty()) {
         size_t old = 0;
         for (size_t i = 1; i < cache_->parked.size(); ++i)
             if (cache_->parked[i].used < cache_->parked[old].used) old = i;
-        std::fprintf(stderr, "conversation cache: evicted %zu tokens\n", cache_->parked[old].len);
+        const size_t out_len = cache_->parked[old].len;
+        const double out_mib = mib_of(conv_bytes(cache_->parked[old]));
+        const char* why = bytes_held() + need > cache_->budget ? "budget" : "slots";
         cache_->parked.erase(cache_->parked.begin() + old);
         ++cache_->evictions;
+        std::fprintf(stderr,
+                     "conversation cache: evicted %zu tokens, %.1f MiB freed (%s): held %.1f MiB of %.1f MiB, slots %zu of %zu\n",
+                     out_len, out_mib, why, mib_of(bytes_held()), mib_of(cache_->budget), cache_->parked.size(), cache_->slots);
     }
     while (bytes_held() + need > cache_->budget && !live_.ckpts.empty()) live_.ckpts.erase(live_.ckpts.begin());
 }
@@ -414,12 +467,14 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     // ROUND_MS, a verify row DRAFT_ROW_MS more and a draft call after d1 DRAFT_CALL_MS (Q4, lab, 2026-10-25, prose with
     // K fixed at 1 / 2 / 3 / 4: 12.47 / 14.76 / 16.60 / 18.34 ms a round). FNX_DRAFT_ADAPT=0: always K
     const bool adapt = env_int("FNX_DRAFT_ADAPT", 1) != 0;
-    constexpr double ROUND_MS = 11.2, DRAFT_ROW_MS = 1.3, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
-    std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.7);   // a prior of 70% at every position
+    const int max_k = env_int("FNX_SPEC_DRAFTS", 0) > 0 ? std::min(K_, (int) env_int("FNX_SPEC_DRAFTS", K_)) : K_;
+    const double DRAFT_ROW_MS = (env_int("FNX_CPU_MOE", 0) != 0) ? 4.5 : 1.3;
+    constexpr double ROUND_MS = 11.2, DRAFT_CALL_MS = 0.65, DECAY = 0.90;
+    std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.5);
     auto chain_len = [&](double call_ms) {
-        int best = K_;
+        int best = max_k;
         double best_rate = -1.0, expect = 1.0, reach = 1.0;
-        for (int k = 1; k <= K_; ++k) {   // at least d1: its acceptance stays measured (it pays above ~8% anyway)
+        for (int k = 1; k <= max_k; ++k) {
             reach *= stood[(size_t) k - 1] / tried[(size_t) k - 1], expect += reach;
             const double rate = expect / (ROUND_MS + k * DRAFT_ROW_MS + std::max(0, k - 1) * call_ms);
             if (rate > best_rate) best_rate = rate, best = k;
@@ -463,6 +518,8 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // drafts that would run past the context are cut; a window must fit at least its first row
         const int room = e_.max_ctx() - e_.pos() - 1;
         if (room < 0) break;
+        const int max_spec = (int) env_int("FNX_SPEC_DRAFTS", 3);
+        if ((int) drafts.size() > max_spec) drafts.resize((size_t) max_spec), qs.resize((size_t) max_spec);
         if ((int) drafts.size() > room) drafts.resize(room), qs.resize(room);
         std::vector<int> rows{x};
         rows.insert(rows.end(), drafts.begin(), drafts.end());

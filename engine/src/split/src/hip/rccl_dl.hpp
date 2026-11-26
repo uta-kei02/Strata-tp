@@ -1,7 +1,8 @@
 // RCCL for the prompt path's chunk sums (AMD, FNX_PF_RCCL=1 behind a passed peer probe): loaded at run time with dlopen, never linked, so a missing library can only mean
 // "the host exchange for the prompt sums, one plain line" and the engine starts exactly as before. CPU only (no HIP header: a stream is an opaque pointer), so
-// tools/rccl_policy_test.cpp holds the loader and the decision to their rules without a card. The library comes with the standard AMD Linux install (setup.py installs the
-// rocm[libraries] wheel: librccl.so.1, BSD-3-clause text from NVIDIA with AMD modifications, in share/doc/rccl/LICENSE.txt of the SDK); we do not copy or ship it.
+// tools/rccl_policy_test.cpp holds the loader and the decision to their rules without a card. The library is the collective library of whichever box this is: NVIDIA NCCL
+// (the libnccl.so.2 / libnccl.so.1 a CUDA install leaves on the library path, or a build outside it named by FNX_RCCL_LIB) or AMD RCCL (the rocm[libraries]
+// wheel ships librccl.so.1); both are BSD-3-clause, in share/doc/<nccl|rccl>/LICENSE.txt of the SDK - nothing is copied or shipped here, and FNX_RCCL_LIB names one explicitly.
 // The six functions and the two enum values are RCCL's (rccl.h: ncclSum = 0, ncclFloat16 = 6, ncclFloat32 = 7, ncclSuccess = 0).
 #pragma once
 
@@ -13,6 +14,7 @@
 #include <functional>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 namespace fnx {
 
@@ -29,33 +31,51 @@ struct RcclApi {
     const char* (*ErrorString)(int result) = nullptr;
 };
 
-// path: the library to load ("" = librccl.so.1 from the library path; FNX_RCCL_LIB overrides it, for tests). false with the reason in why.
+// path: the library to load ("" = the defaults below; FNX_RCCL_LIB overrides everything, for tests and for a non-standard install).
+// false with the reason in why.
+// (tp-opt) the defaults are tried in order: the NVIDIA NCCL SONAMEs a CUDA install leaves on the library path first (libnccl.so.2 /
+// libnccl.so.1, which on a box whose token exchange rides on NCCL over NVLink is the one that works), then AMD's librccl.so.1.
+// A candidate that will not open is tried through to the next; when all of them fail the engine keeps the host
+// exchange for the prompt sums with the one plain line the upstream loader already prints - and so is a candidate that opens but
+// turns out not to carry the six entry points (an old SONAME, a stub, a renamed build): giving up there would throw away the next
+// name on the list, which is exactly the one that works on a box where the first hit is a leftover. `why` then holds the reason of
+// the last candidate tried. An explicit FNX_RCCL_LIB is taken alone:
+// no fallback, so a pointed-at library says exactly what it is (tools/rccl_policy_test.cpp).
 inline bool rccl_load(RcclApi& api, const std::string& path, std::string& why) {
+    std::vector<std::string> tries;
     const char* over = std::getenv("FNX_RCCL_LIB");
-    const std::string lib = over && *over ? over : (path.empty() ? "librccl.so.1" : path);
-    api.handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!api.handle) {
-        const char* e = dlerror();
-        why = "cannot load " + lib + (e ? std::string(": ") + e : "");
-        return false;
-    }
-    auto sym = [&](const char* name, auto& fn) {
-        void* p = dlsym(api.handle, name);
-        if (!p) {
-            why = lib + " has no " + name;
-            return false;
+    if (over && *over)
+        tries.push_back(over);
+    else if (!path.empty())
+        tries.push_back(path);
+    else
+        tries = {"libnccl.so.2", "libnccl.so.1", "librccl.so.1"};
+    for (const std::string& lib : tries) {
+        api.handle = dlopen(lib.c_str(), RTLD_NOW | RTLD_LOCAL);
+        if (!api.handle) {
+            const char* e = dlerror();
+            why = "cannot load " + lib + (e ? std::string(": ") + e : "");
+            continue;
         }
-        fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p);
+        auto sym = [&](const char* name, auto& fn) {
+            void* p = dlsym(api.handle, name);
+            if (!p) {
+                why = lib + " has no " + name;
+                return false;
+            }
+            fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(p);
+            return true;
+        };
+        if (!sym("ncclCommInitAll", api.CommInitAll) || !sym("ncclAllReduce", api.AllReduce) || !sym("ncclGroupStart", api.GroupStart) ||
+            !sym("ncclGroupEnd", api.GroupEnd) || !sym("ncclCommDestroy", api.CommDestroy) || !sym("ncclGetErrorString", api.ErrorString)) {
+            dlclose(api.handle);
+            api.handle = nullptr;
+            continue;   // not this one: the next name on the list may be the real library
+        }
+        why = lib;
         return true;
-    };
-    if (!sym("ncclCommInitAll", api.CommInitAll) || !sym("ncclAllReduce", api.AllReduce) || !sym("ncclGroupStart", api.GroupStart) ||
-        !sym("ncclGroupEnd", api.GroupEnd) || !sym("ncclCommDestroy", api.CommDestroy) || !sym("ncclGetErrorString", api.ErrorString)) {
-        dlclose(api.handle);
-        api.handle = nullptr;
-        return false;
     }
-    why = lib;
-    return true;
+    return false;
 }
 
 // The decision: FNX_PF_RCCL=0 or unset (the default, until the screens say the prompt sums win): the host exchange, no line. =1: only with the peer push on (RCCL moves its

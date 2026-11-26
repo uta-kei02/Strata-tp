@@ -3,8 +3,8 @@
 // and the host exchange. The engine calls the six functions only through the RcclApi pointers.
 #pragma once
 
-#include <hip/hip_fp16.h>
-#include <hip/hip_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <memory>
@@ -57,30 +57,30 @@ inline bool rccl_open(const std::vector<int>& devs, std::shared_ptr<RcclState>& 
     const float scale_sum = (float) (n * (n + 1) / 2);
     std::vector<__half*> buf((size_t) n, nullptr);
     std::vector<unsigned*> bad((size_t) n, nullptr);
-    std::vector<hipStream_t> str((size_t) n, nullptr);
+    std::vector<cudaStream_t> str((size_t) n, nullptr);
     auto cleanup = [&] {
         for (int i = 0; i < n; ++i) {
-            hipSetDevice(devs[(size_t) i]);
-            if (buf[(size_t) i]) hipFree(buf[(size_t) i]);
-            if (bad[(size_t) i]) hipFree(bad[(size_t) i]);
-            if (str[(size_t) i]) hipStreamDestroy(str[(size_t) i]);
+            cudaSetDevice(devs[(size_t) i]);
+            if (buf[(size_t) i]) cudaFree(buf[(size_t) i]);
+            if (bad[(size_t) i]) cudaFree(bad[(size_t) i]);
+            if (str[(size_t) i]) cudaStreamDestroy(str[(size_t) i]);
         }
     };
     for (int i = 0; i < n; ++i) {
-        hipSetDevice(devs[(size_t) i]);
-        if (hipMalloc((void**) &buf[(size_t) i], (size_t) cnt * 2) != hipSuccess || hipMalloc((void**) &bad[(size_t) i], 4) != hipSuccess ||
-            hipStreamCreateWithFlags(&str[(size_t) i], hipStreamNonBlocking) != hipSuccess) {
-            hipGetLastError();
+        cudaSetDevice(devs[(size_t) i]);
+        if (cudaMalloc((void**) &buf[(size_t) i], (size_t) cnt * 2) != cudaSuccess || cudaMalloc((void**) &bad[(size_t) i], 4) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&str[(size_t) i], cudaStreamNonBlocking) != cudaSuccess) {
+            cudaGetLastError();
             cleanup();
             why = "the self-test buffers could not be allocated";
             return false;
         }
-        hipMemset(bad[(size_t) i], 0, 4);
+        cudaMemset(bad[(size_t) i], 0, 4);
         rccl_detail::k_fill16<<<256, 256, 0, str[(size_t) i]>>>(buf[(size_t) i], cnt, (float) (i + 1));
     }
     r = s->api.GroupStart();
     for (int i = 0; i < n && r == RCCL_SUCCESS; ++i) {
-        hipSetDevice(devs[(size_t) i]);
+        cudaSetDevice(devs[(size_t) i]);
         r = s->api.AllReduce(buf[(size_t) i], buf[(size_t) i], (size_t) cnt, RCCL_FLOAT16, RCCL_SUM, s->comm[(size_t) i], (void*) str[(size_t) i]);
     }
     const int r2 = s->api.GroupEnd();
@@ -90,14 +90,14 @@ inline bool rccl_open(const std::vector<int>& devs, std::shared_ptr<RcclState>& 
         return fail("ncclAllReduce", r);
     }
     for (int i = 0; i < n; ++i) {
-        hipSetDevice(devs[(size_t) i]);
+        cudaSetDevice(devs[(size_t) i]);
         rccl_detail::k_check16<<<256, 256, 0, str[(size_t) i]>>>(buf[(size_t) i], cnt, scale_sum, bad[(size_t) i]);
     }
     // a bounded wait (30 s): a collective that never completes must not hang the start
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < n; ++i) {
-        hipSetDevice(devs[(size_t) i]);
-        while (hipStreamQuery(str[(size_t) i]) == hipErrorNotReady)
+        cudaSetDevice(devs[(size_t) i]);
+        while (cudaStreamQuery(str[(size_t) i]) == cudaErrorNotReady)
             if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(30)) {
                 why = "the self-test all-reduce did not finish in 30 s";
                 return false;   // (buffers stay: the kernels may still be running)
@@ -105,14 +105,14 @@ inline bool rccl_open(const std::vector<int>& devs, std::shared_ptr<RcclState>& 
     }
     unsigned total = 0;
     for (int i = 0; i < n; ++i) {
-        hipSetDevice(devs[(size_t) i]);
+        cudaSetDevice(devs[(size_t) i]);
         unsigned b = 0;
-        hipMemcpy(&b, bad[(size_t) i], 4, hipMemcpyDeviceToHost);
+        cudaMemcpy(&b, bad[(size_t) i], 4, cudaMemcpyDeviceToHost);
         total += b;
     }
     cleanup();
-    if (hipGetLastError() != hipSuccess) {
-        why = "a HIP error during the self-test";
+    if (cudaGetLastError() != cudaSuccess) {
+        why = "a CUDA error during the self-test";
         return false;
     }
     if (total) {

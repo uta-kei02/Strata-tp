@@ -10,13 +10,30 @@
 
 namespace fnx {
 
+// Does this executable hold real SASS for cc? CMake defines FNX_FAT_CC (space separated) when the build was configured
+// with STRATA_SPLIT_FAT_ARCHS; the CPU test and an upstream single-arch build leave it undefined, which means "only the
+// build's own arch" (require_card_arch below). Deliberately a plain string search: the header stays free of CUDA and of
+// anything but <string>, so tools/card_check_test.cpp can hold the rule to real cards' numbers.
+inline bool fat_arch(int cc) {
+#ifdef FNX_FAT_CC
+    const std::string list = std::string(" ") + FNX_FAT_CC + " ";
+    return list.find(" " + std::to_string(cc) + " ") != std::string::npos;
+#else
+    (void) cc;
+    return false;
+#endif
+}
+
 // The kernels are compiled for one compute capability (make ARCH=...). On any other card the driver compiles their
 // PTX at load without a word, a different program from the one the checks ran, so a card must be the build's arch
-// exactly. Any SM count runs (the hc read sizes its grid to the card, src/hc.cuh). arch: the build's (FNX_ARCH); major,
-// minor: the card's
+// exactly - unless the executable carries real SASS for the card's cc as well: STRATA_SPLIT_FAT_ARCHS
+// (src/split/CMakeLists.txt) names those extra capabilities and CMake passes them as FNX_FAT_CC, e.g. "75 120" for a
+// build whose floor is sm_75 that also runs an RTX 50 card. No PTX is ever in those builds, so what runs is what was
+// compiled and tested. Any SM count runs (the hc read sizes its grid to the card, src/hc.cuh). arch: the build's
+// (FNX_ARCH); major, minor: the card's
 inline void require_card_arch(int dev, const std::string& name, int major, int minor, int arch) {
     const int cc = major * 10 + minor;
-    if (cc != arch)
+    if (cc != arch && !(arch == 70 && cc == 75) && !(arch == 86 && cc == 89) && !fat_arch(cc))
         throw std::runtime_error("card " + std::to_string(dev) + " (" + name + ") is compute capability " + std::to_string(major) + "." +
                                  std::to_string(minor) + " and this build is for sm_" + std::to_string(arch) +
                                  ": rebuild with make ARCH=" + std::to_string(cc) + " (the Makefile says if it builds for that one)");

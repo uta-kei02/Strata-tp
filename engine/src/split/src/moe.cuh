@@ -16,66 +16,123 @@ constexpr int RR_THREADS = 256, RR_WPR = 2, RR_ROWS = RR_THREADS / 32 / RR_WPR; 
 // slot of the layer's pool that the pool's CLOCK hand reaches first with ref 0 (a ref 1 it passes drops to 0), its old
 // expert pointing back at RAM. The hand goes round the pool's slots past its lent ones. list: how many took a slot,
 // then their ids
+template <int T>
 __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
     const int lane = threadIdx.x & 31, base = layer * NEXP, p = ec.pool_of[layer], lent = ec.lent[p];
-    // an arena's pools hold every expert until it lends, and then only its own pool's experts can be missing
     if (ec.arena_full && (p != ec.arena_pool || lent == 0)) {
         if (lane == 0) list[0] = 0;
         return;
     }
-    const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
-    for (int j = lane; j < nj; j += 32)
-        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 2;
+    // FNX_SWAP_THRESH lands in ec.lent[EC_POOLS + 1] (model.cpp) but the gravity plan below keeps its own fixed bars:
+    // promote at score 255, and protect a serving slot while the coldest victim is still at score 64 or above. The
+    // threshold is not read on purpose, so a tuning knob is never mistaken for behavior (docs: not in effect).
+    const int swap_cap = ec.lent[EC_POOLS + 2];
+    int* freq = ec.slot_of + NL * NEXP;
+
+    const int s0 = max(ec.hand[p], ec.s0[p] + lent), n = (ec.s0[p] + ec.n[p]) - s0;
+    if (n <= 0) {
+        if (lane == 0) list[0] = 0;
+        return;
+    }
+
+    // 1. 全体減衰: 1/8減衰 (freq -= max(1, freq >> 3)) で一時休止中の現役1軍が即座に0へ落ちるのを防ぐ
+    for (int x = lane; x < NEXP; x += 32) {
+        const int gx = base + x;
+        const int f = freq[gx];
+        if (f > 0) freq[gx] = f - max(1, f >> 3);
+    }
     __syncwarp();
-    int hand = ec.hand[p] - s0, k = 0;   // within the slots not lent
-    if (hand < 0 || hand >= n) hand = 0;
-    // the misses found 32 jobs at a time (a load each, side by side), then taken in job order
-    for (int j0 = 0; j0 < nj; j0 += 32) {
-        unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] < 0);
-        while (miss) {
-            const int g = base + jobs[j0 + __ffs(miss) - 1].w;
-            miss &= miss - 1;
-            int victim = -1;
-            while (victim < 0) {
-                const int idx = s0 + (hand + lane) % n;
-                const unsigned char r = ec.ref[idx];
-                const unsigned free = __ballot_sync(0xffffffffu, r == 0);
-                const int f = free ? __ffs(free) - 1 : 32;
-                if (lane < f && r == 1) ec.ref[idx] = 0;
-                if (free) victim = s0 + (hand + f) % n;
-                hand = (hand + (free ? f + 1 : 32)) % n;
+
+    // 2. 層あたり64B (NEXP/8 byte = uint32_t x 16) のビットフラグ連続発火フィルタ（未発火エキスパートへのつられ加算ゼロ）
+    __device__ static uint32_t win_mask[NL][16];
+    __shared__ uint32_t step_mask[16];
+
+    if (lane < 16) step_mask[lane] = 0u;
+    __syncwarp();
+
+    // 単発発火は +80、前ステップの64Bマスクにも居た連続発火は +140 (3連続で 80->210->255 到達)
+    const int base_grav = 80;
+    const int streak_bonus = 60;
+
+    if (lane == 0) {
+        for (int j = 0; j < nj; ++j) {
+            const int w = jobs[j].w;
+            if (w >= 0 && w < NEXP) {
+                const int g = base + w;
+                const int s = ec.slot_of[g];
+                if (s >= s0) ec.ref[s] = 2; // 今ステップで使用中の1軍をロック
+                const uint32_t w_word = win_mask[layer][w >> 5];
+                const int add_g = ((w_word >> (w & 31)) & 1u) ? (base_grav + streak_bonus) : base_grav;
+                freq[g] = min(255, freq[g] + add_g);
+                step_mask[w >> 5] |= (1u << (w & 31));
             }
-            if (lane == 0) {
-                if (const int o = ec.owner[victim]; o >= 0) {
-                    ec.slot_of[o] = -1;
-                    ec.ep_gu[o] = ec.host_gu[o];
-                    ec.ep_dn[o] = ec.host_dn[o];
-                }
-                ec.owner[victim] = g;
-                ec.slot_of[g] = victim;
-                ec.ref[victim] = 2;
-                char* at = ec.pool[p] + (size_t) (victim - ec.s0[p]) * ec.slot_bytes[p];
-                ec.ep_gu[g] = at;
-                ec.ep_dn[g] = at + ec.dn_off[p];
-                list[1 + k] = g;
-            }
-            ++k;
-            __syncwarp();
         }
     }
-    for (int j = lane; j < nj; j += 32) ec.ref[ec.slot_of[base + jobs[j].w]] = 1;
-    if (lane == 0) {
-        ec.hand[p] = s0 + hand;
-        list[0] = k;
-    }
-}
+    __syncwarp();
 
+    // 直近ステップの発火ビットマスク(64B)で上書き更新（OR累積による512bit飽和を防止）
+    if (lane < 16) {
+        win_mask[layer][lane] = step_mask[lane];
+    }
+    __syncwarp();
+
+    // 3. スコア255到達エキスパートの昇格（現役1軍の保護壁: 使用中 ref==2 を除外し、min_sc < 64 の冷えた枠のみ入れ替え）
+    const int cap = (swap_cap > 0) ? swap_cap : 1;
+    int k = 0;
+    if (lane == 0) {
+        for (int j = 0; j < nj && k < cap; ++j) {
+            const int w = jobs[j].w;
+            const int g = base + w;
+            if (ec.slot_of[g] >= 0) continue;
+            if (freq[g] < 255) continue;
+
+            int victim = -1;
+            int min_sc = 999999;
+            for (int i = 0; i < n; ++i) {
+                const int cand = s0 + i;
+                if (ec.ref[cand] == 2) continue; // 今ステップでHITしている現役1軍は絶対に追い出さない
+                const int co = ec.owner[cand];
+                if (co == -2) continue;
+                const char* cat = ec.pool[p] + (size_t) (cand - ec.s0[p]) * ec.slot_bytes[p];
+                if (co >= 0 && ec.host_gu[co] == cat) continue;
+                const int sc = (co < 0) ? -1 : (int) freq[co];
+                if (sc < min_sc) {
+                    min_sc = sc;
+                    victim = cand;
+                }
+            }
+            // 最も冷えている1軍でもスコア64以上（直近約10ステップ以内に稼働）なら現役とみなして入れ替えを中止
+            if (victim < 0 || min_sc >= 64) break;
+
+            if (const int o = ec.owner[victim]; o >= 0) {
+                ec.slot_of[o] = -1;
+                ec.ep_gu[o] = ec.host_gu[o];
+                ec.ep_dn[o] = ec.host_dn[o];
+                freq[o] = 32; // 退避した元1軍も完全0にはせず余熱を残す
+            }
+            ec.owner[victim] = -2;
+            ec.ref[victim] = 2;
+            freq[g] = 192; // 昇格した新1軍に初期保護スコア192を付与
+            list[1 + k] = (victim << 16) | (g & 0xffff);
+            ++k;
+        }
+    }
+    __syncwarp();
+
+    for (int j = lane; j < nj; j += 32) {
+        const int s = ec.slot_of[base + jobs[j].w];
+        if (s >= s0) ec.ref[s] = 1;
+    }
+    if (lane == 0) list[0] = k;
+}
 template <int T>
 __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
                                                             float* __restrict__ logits, int* __restrict__ topi,
                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
-                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su) {
+                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su,
+                                                            CpuMoeBox* d_cpu_box, const char* __restrict__ l2_map,
+                                                            const unsigned char* __restrict__ xq_rows, int l2_cap) {
     static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
     constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;   // float4 chunks per lane
     const int nrr = (int) gridDim.x - su.blocks;              // the router's own blocks; the shared expert's after them
@@ -148,6 +205,12 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
                 const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
             }
+            // A row whose logits are all NaN (or all -inf) never wins a comparison, so the sentinel survives the
+            // reduce. Kept as-is it indexes one past the shared arrays below: firstpair[NEXP] lands on slots[0],
+            // jobof[NEXP] reads whatever follows, and the wild job index that comes out of it writes gu[j] outside
+            // shared memory -- the write the two Turing cards faulted on (Xid 31, FAULT_PDE ... VIRT_WRITE).
+            // Clamping to expert 0 changes only a row that is already garbage; a normal row always has bi < NEXP.
+            if (bi >= NEXP) bi = 0;
             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
             if (k == 0) top0 = bv;
             const float ek = __expf(bv - top0);
@@ -196,9 +259,92 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
         njobs[0] = nj = n;
         *counter = 0u;
     }
-    if (!ec.n_slots) return;
+    if (!ec.n_slots) {
+        if (d_cpu_box && e == 0) {
+            d_cpu_box->n_miss = 0;
+            d_cpu_box->n_l2 = 0;   // both counters are always this launch's answer, never last round's
+        }
+        return;
+    }
     __syncthreads();
-    if (warp == 0) cache_plan(gu, nj, layer, ec, list);
+    if (warp == 0) cache_plan<T>(gu, nj, layer, ec, list);
+    if (!d_cpu_box) return;
+    __syncthreads();
+    // Separate VRAM-resident jobs (for GPU) vs RAM-resident misses (for CPU Hybrid TP worker) in-place
+    __shared__ int s_n_miss, s_n_l2;
+    if (e == 0) {
+        int g_cnt = 0, m_cnt = 0, l_cnt = 0;
+        const int base = layer * NEXP;
+        // rev.15-M2b-2: a pick with no slot on this card but resident in the tier card's arena goes to the tier
+        // instead of the host worker (l2_dec.hpp). The order is the card's slot, then the arena, then host RAM, and a
+        // pick lands in exactly one of the three: what this drops from the card's jobs (njobs[0] = g_cnt) is answered
+        // by exactly one of the other two, so the ring still sums each pair once.
+        const bool tier_on = l2_map && layer >= 0 && layer < NL;
+        const int lcap = (l2_cap > 0 && l2_cap < P) ? l2_cap : P;
+        for (int j = 0; j < nj; ++j) {
+            const Job jb_gu = gu[j];
+            const Job jb_dn = dn[j];
+            const int w = jb_gu.w;
+            if (ec.slot_of[base + w] >= 0) {
+                if (g_cnt != j) {
+                    gu[g_cnt] = jb_gu;
+                    dn[g_cnt] = jb_dn;
+                }
+                ++g_cnt;
+            } else if (tier_on && l_cnt < lcap && jb_gu.n > 0 && jb_gu.n <= MAXT && l2_map[base + w]) {
+                // the job's shape is checked here as well: what goes to the tier lands in the box's [l2][MAXT] rows,
+                // so a job wider than the box stays with the cards and the host worker rather than being written past
+                // the end of one of its lists
+                d_cpu_box->l2_w[l_cnt] = w;
+                d_cpu_box->l2_n[l_cnt] = jb_gu.n;
+                for (int s = 0; s < jb_gu.n; ++s) {
+                    d_cpu_box->l2_y[l_cnt][s] = jb_gu.y[s];
+                    d_cpu_box->l2_out[l_cnt][s] = jb_gu.out[s];
+                }
+                ++l_cnt;
+            } else {
+                d_cpu_box->miss_w[m_cnt] = w;
+                d_cpu_box->miss_n[m_cnt] = jb_gu.n;
+                for (int s = 0; s < jb_gu.n; ++s) {
+                    d_cpu_box->miss_y[m_cnt][s] = jb_gu.y[s];
+                    d_cpu_box->miss_out[m_cnt][s] = jb_gu.out[s];
+                }
+                ++m_cnt;
+            }
+        }
+        s_n_miss = m_cnt;
+        s_n_l2 = l_cnt;
+        njobs[0] = g_cnt;
+        d_cpu_box->layer = layer;
+        d_cpu_box->T = T;
+        d_cpu_box->n_miss = m_cnt;
+        d_cpu_box->n_l2 = l_cnt;
+    }
+    __syncthreads();
+    if (s_n_miss > 0) {
+        for (int i = e; i < T * N; i += RR_THREADS) {
+            d_cpu_box->x_in[i] = x[i];
+        }
+    }
+    // The tier reads this card's activation rows as they already stand (q8_1), which is what lets it run the very
+    // gate|up and down kernels the cards run on the same bytes; only the window's rows, and only for a round that
+    // has picks of its own. The rows and the misses are both written before the single counter bump below, so a
+    // worker woken by that counter sees both lists whole.
+    __syncthreads();
+    if (s_n_l2 > 0 && xq_rows) {
+        constexpr int WROW = (int) (q8_1_bytes(N) / 4);   // one activation row, as words
+        const unsigned* src = reinterpret_cast<const unsigned*>(xq_rows);
+        unsigned* dst = reinterpret_cast<unsigned*>(&d_cpu_box->x_q8[0]);
+        for (int i = e; i < T * WROW; i += RR_THREADS) {
+            dst[i] = src[i];
+        }
+    }
+    __syncthreads();
+    if ((s_n_miss > 0 || s_n_l2 > 0) && e == 0) {
+        __threadfence_system();
+        d_cpu_box->req_seq = d_cpu_box->req_seq + 1ULL;
+        __threadfence_system();
+    }
 }
 
 // rows of one job: tmp[j] = W row . y[ys[j]] for j < n <= TT, G lanes per row

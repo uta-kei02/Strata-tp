@@ -257,9 +257,23 @@ constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * GCB / GCR_T
               GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
 static_assert(GCH * HS % GCR_THREADS == 0 && GCH * GCB % GCR_THREADS == 0, "even shares");
 
-__global__ void __launch_bounds__(GCR_THREADS) k_gdn_ch_rec(const float* __restrict__ xc, const float* __restrict__ prep,
-                                                           float* __restrict__ S, float* __restrict__ y32, int nk, int nv,
-                                                           const int* __restrict__ vmap, int C) {
+// The scan exists in two state-column widths, because one width cannot cover every card: the CUDA layout's 32 columns
+// wants 74,372 B of dynamic shared memory, more than a sm_75 block may opt into (65,536 B), while 16 columns wants
+// 57,988 B and takes it. GCBT is that width; threads, shares and shared memory follow from it exactly as the
+// constants above follow from this build's default, and every output's sum runs in the same order either way.
+template <int GCBT> constexpr int gcr_threads_t = GCH * GCBT / 8 * 2;
+template <int GCBT> constexpr size_t gch_rec_smem_t = sizeof(float) * (2 * GCH * (HS + 1) + HS * GCBT + 4 * GCH * GCBT + GCH_PREP_FLOATS);
+template <int GCBT> constexpr int gch_rec_blocks_t = HS / GCBT;
+static_assert(gcr_threads_t<GCB> == GCR_THREADS && gch_rec_smem_t<GCB> == GCH_REC_SMEM, "the templated scan is the layout above");
+static_assert(gch_rec_smem_t<16> <= 65536 && gch_rec_smem_t<32> > 65536, "16 state columns is the width a Turing block can take");
+
+template <int GCBT>
+__global__ void __launch_bounds__(gcr_threads_t<GCBT>) k_gdn_ch_rec(const float* __restrict__ xc, const float* __restrict__ prep,
+                                                                    float* __restrict__ S, float* __restrict__ y32, int nk, int nv,
+                                                                    const int* __restrict__ vmap, int C) {
+    constexpr int GCB = GCBT, GCR_THREADS = gcr_threads_t<GCBT>, GCR_CG = GCB / 4, GCH_REC_BLOCKS_PER_HEAD = HS / GCB;
+    constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * GCB / GCR_THREADS,
+                  GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
     const int lv = blockIdx.x / GCH_REC_BLOCKS_PER_HEAD, c0 = (blockIdx.x % GCH_REC_BLOCKS_PER_HEAD) * GCB;
     const int kh = vmap[lv] & 255, tid = threadIdx.x, ch = (2 * nk + nv) * HS;
     extern __shared__ float gsm[];

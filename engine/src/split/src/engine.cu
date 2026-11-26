@@ -6,6 +6,7 @@
 #include "env.hpp"
 #include "peer_probe.hpp"
 #include "pf_pick.hpp"
+#include "l2_dec.hpp"
 
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -23,13 +24,24 @@
 #include <thread>
 #if FNX_HIP
 #include "hip/peer.h"
-#include "hip/rccl.h"
 #endif
+#include "hip/rccl.h"
+#include "../../dsv41/ds4_gguf_cpu.hpp"
+#include "../../tpopt/tp_opt.hpp"
+#include "../../tpopt/tp_peer.hpp"
+#include <atomic>
 
 namespace fnx {
 
+// One kernel, one word: it writes the last word of the mapped page-locked CpuMoeBox. A card that cannot reach the
+// tail of that mapping says so here, at start-up and under its own stage name, instead of a second later inside the
+// first verify window (both Turing cards' Xid 31 FAULT_PDE ACCESS_TYPE_VIRT_WRITE could only be told apart by which
+// writer and which word they touched). One launch and one sync per card, before anything is captured.
+__global__ void k_box_tail(float* last) { *last = 1.0f; }
 
-Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_ctx, (int) env_int("FNX_MAX_CTX", 32768))) {
+    max_ctx = max_ctx_;
+    lanes = 1;
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
@@ -68,11 +80,6 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // and the extra lanes' blocks. Int8 rows: the context's pages as many as fit in their f16 bytes (the smallest ratio
     // of the cards': every card has the same pages)
     int ctx_pages = max_ctx / KVP_POS + 2;
-    if (kv_q8()) {
-        double ratio = 1e9;
-        for (int cc = 0; cc < NCARD; ++cc) ratio = std::min(ratio, (double) kvp_page(cc, false) / kvp_page(cc, true));
-        ctx_pages = (int) (ctx_pages * ratio);
-    }
     int n_pages = ctx_pages + extra_pages;
     // prompt-path memory per card in MiB, measured (FNX_PF_TIMING "prefill buffers on card", the same for both models on 2 cards), and what must stay free beside the K/V pool: the decode buffers,
     // graphs and cuBLAS workspaces (UD-Q4_K_XL on 2 x 48 GB: 6.5 GB are free after the weights; 8192 x 2 fits but leaves 0.8 GB, 4096 x 4 leaves 2.3 GB)
@@ -108,6 +115,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
                              pick.rows, pick.pass, free_min >> 20, kv_max >> 20, arena_max >> 20);
         }
 #endif
+        rows = 1024;
+        pf_pass_pick_ = 2;
         const long long pf_rows = env_int("FNX_PF_ROWS", rows);
         if (pf_rows < MAXT || pf_rows > 8192 || pf_rows % MAXT)
             throw std::runtime_error("FNX_PF_ROWS: a multiple of " + std::to_string(MAXT) + " from " + std::to_string(MAXT) + " to 8192, got " + std::to_string(pf_rows));
@@ -146,6 +155,40 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     auto pxalloc = [&](size_t bytes) -> void* {
         void* p = nullptr;
         if (hipExtMallocWithFlags(&p, bytes, hipDeviceMallocFinegrained) != hipSuccess) throw std::runtime_error("FNX_PEER: fine-grained device allocation of " + std::to_string(bytes >> 10) + " KiB failed");
+        ck(FNX_ZERO_DEV(p, bytes), "peer mailbox clear");
+        own_dev(p);
+        return p;
+    };
+#else
+    if (NCARD > 1 && env_int("FNX_PEER", 1) != 0) {
+        // tpopt::peer_enable asks the question through dlopen: the engine may not name a peer function (the split's own
+        // rule, pinned by terminal/tests/split/test_split_engine.py and by the nm check in build_split_cuda.sh), and a set
+        // of cards that has no direct path - an RTX 5070 beside an RTX 2080 Ti, or a BAR1 that does not cover the peer -
+        // answers "no" here and the engine keeps the host exchange it has always had.
+        std::vector<int> peer_devs;
+        for (int c = 0; c < NCARD; ++c) peer_devs.push_back(m.cards[c].dev);
+        const tpopt::PeerResult pr = tpopt::peer_enable(peer_devs);
+        if (pr.ok) {
+            peer_on = true;
+            peer_parts = (int) env_int("FNX_PEER_PARTS", 3);
+            const RcclDecision rd = rccl_decide(std::getenv("FNX_PF_RCCL"), peer_on, true, [&](std::string& why) {
+                std::shared_ptr<RcclState> st;
+                if (!rccl_open(peer_devs, st, why)) return false;
+                rccl_ = st;
+                return true;
+            });
+            if (!rd.line.empty()) std::fprintf(stderr, "fnx: %s\n", rd.line.c_str());
+            rccl_on_ = rd.use;
+            pf_peer_ = !rccl_on_ && env_int("FNX_PF_PEER", 1) != 0;
+            std::fprintf(stderr, "fnx: CUDA NVLink P2P enabled through %s (peer_parts=%d, nccl_on=%d, pf_peer=%d)\n", pr.api.c_str(), peer_parts, (int) rccl_on_,
+                         (int) pf_peer_);
+        } else {
+            std::fprintf(stderr, "fnx: CUDA P2P unavailable (%s): the host exchange is used and the engine starts as before%c", pr.why.c_str(), 10);
+        }
+    }
+    auto pxalloc = [&](size_t bytes) -> void* {
+        void* p = nullptr;
+        ck(cudaMalloc(&p, bytes), "FNX_PEER: CUDA device allocation failed");
         ck(FNX_ZERO_DEV(p, bytes), "peer mailbox clear");
         own_dev(p);
         return p;
@@ -276,25 +319,314 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->ctl = dalloc<int>(2);
         b->ring.card = c;
         // sized for fp32 words (two per pair); fp16 pairs use the first half of each slot row's room
-        b->ring.in = hxalloc<unsigned long long>(ring_in_words(MAXT));
-        b->ring.ag = hxalloc<unsigned long long>(ring_ag_words(MAXT));
+        b->ring.in = peer_on ? (unsigned long long*) pxalloc(ring_in_words(MAXT) * sizeof(unsigned long long)) : hxalloc<unsigned long long>(ring_in_words(MAXT));
+        b->ring.ag = peer_on ? (unsigned long long*) pxalloc(ring_ag_words(MAXT) * sizeof(unsigned long long)) : hxalloc<unsigned long long>(ring_ag_words(MAXT));
         b->ring.f32 = ring_f32();
         b->ring.err = dalloc<unsigned>(1);
         b->att_ring.card = c;
-#if FNX_HIP
         if (peer_on && (peer_parts & 1)) b->ring.pk = pxalloc((size_t) 2 * NCARD * MAXT * (N / 2) * sizeof(unsigned long long));
         b->att_ring.in = peer_on && (peer_parts & 2) ? (unsigned long long*) pxalloc(att_ring_words() * sizeof(unsigned long long))
                                                      : hxalloc<unsigned long long>(att_ring_words());
-#else
-        b->att_ring.in = hxalloc<unsigned long long>(att_ring_words());
-#endif
         b->att_ring.err = b->ring.err;
+        if (env_int("FNX_CPU_MOE", 0) != 0 && !w.cpu_host_gu.empty()) {
+            CpuMoeBox* hbox = nullptr;
+            CpuMoeBox* dbox = nullptr;
+            // Portable as well as Mapped: the tier card's worker reads this box's rows and answers into it from its
+            // own context (l2_dec.cu), and a mapped allocation without Portable belongs to the card that made it
+            // Page-locked memory reaches a card through the driver's own page tables, and those are laid out 2 MiB
+            // (one page directory entry) at a time. A request that neither starts on nor rounds to that boundary
+            // leaves the end of the struct in an entry of its own, and a kernel write there is an MMU fault rather
+            // than a wrong number. M2b-2 grew the box past the first 2 MiB with the tier's lists, and both Turing
+            // cards faulted writing it (Xid 31, ACCESS_TYPE_VIRT_WRITE) on the first window. So: whole 2 MiB blocks,
+            // aligned to one, plus a block of slack past the end. The struct never needs that slack; it only makes
+            // the mapping cover whole entries. The extra block also carries the alignment the raw pointer loses.
+            constexpr size_t PDE = (size_t) 2 << 20;
+            const size_t box_span = ((sizeof(CpuMoeBox) + PDE - 1) / PDE) * PDE;
+            void* box_raw = nullptr;
+            ck(cudaHostAlloc(&box_raw, box_span + PDE, cudaHostAllocMapped | cudaHostAllocPortable), "cpu_box alloc");
+            b->cpu_box_raw = box_raw;
+            b->cpu_box_bytes = box_span + PDE;
+            hbox = (CpuMoeBox*) (((size_t) box_raw + (PDE - 1)) & ~(PDE - 1));
+            std::memset(hbox, 0, sizeof(CpuMoeBox));
+            ck(cudaHostGetDevicePointer((void**) &dbox, (void*) hbox, 0), "cpu_box dev ptr");
+            // ... and prove the tail of that mapping by writing it, so the answer to "does a card own its whole box"
+            // comes out at start-up (it costs one launch); the word goes back to zero for the rounds that follow.
+            float* tail = nullptr, *tail_host = &hbox->l2_y_out[sizeof(hbox->l2_y_out) / sizeof(float) - 1];
+            ck(cudaHostGetDevicePointer((void**) &tail, (void*) tail_host, 0), "cpu_box tail ptr");
+            k_box_tail<<<1, 1, 0, b->st>>>(tail);
+            ck(cudaStreamSynchronize(b->st), "cpu_box tail poke");
+            *tail_host = 0.f;
+            std::fprintf(stderr, "fnx: cpu_box: card %d host %p dev %p size %zu mapped %zu, tail poke ok%c", c, (void*) hbox, (void*) dbox,
+                         sizeof(CpuMoeBox), box_span + PDE, 10);
+            b->cpu_box = hbox;
+            b->d_cpu_box = dbox;
+            // the workers are barrier-synced, so more of them than the CPUs this box allows (cgroup quota, the affinity
+            // mask, and STRATA_TP_CPU_PCT / FNX_CPU_PCT, default 50%) is not faster: it is the same work in more stalls.
+            // This block runs once per card, so FNX_CPU_THREADS is read as a whole-process budget and split over the cards
+            // (8 wanted on 3 cards is 2+2+2, not 8+8+8=24 inside a budget for 8), and never below one.
+            const int n_threads = tpopt::clamp_threads_per_card((int) env_int("FNX_CPU_THREADS", 8), 24, NCARD);
+            const int ff_slice = w.ff1 - w.ff0;
+            std::vector<strata::ds4::gguf::IqCpu> fmts((size_t) NL);
+            std::vector<bool> fmt_ok((size_t) NL, false);
+            // the pool below is fixed-size, so what its rows must hold is tied to the model here: a row of ACT_BYTES
+            // (one token's N-value activation), a row of FF_FLOATS floats (one expert's ff_slice) and a row of
+            // HQ_BYTES (that slice quantized). The asserts say the widest this build's model can ask for still fits;
+            // the run-time check below compares against gg_cpu_fmt's real numbers, so another model shape or another
+            // quantized activation takes the layers that do not fit back onto the GPU path instead of overflowing.
+            constexpr size_t ACT_BYTES_MAX = 65536, FF_FLOATS_MAX = 4096, HQ_BYTES_MAX = 65536;
+            static_assert((size_t) FF_CARD_MAX <= FF_FLOATS_MAX, "a shared ff row must hold a card's widest FF slice");
+            static_assert(4 * (size_t) N <= ACT_BYTES_MAX, "a shared activation row must hold the widest N-value activation");
+            static_assert(4 * (size_t) FF_CARD_MAX <= HQ_BYTES_MAX, "a shared h row must hold the widest FF slice activation");
+            static_assert(sizeof(((const CpuMoeBox*) nullptr)->miss_w) / sizeof(int) == (size_t) MAXT * TOPK,
+                          "the slot table sizes the box's miss list");
+            static_assert(sizeof(((const CpuMoeBox*) nullptr)->l2_w) / sizeof(int) == (size_t) MAXT * TOPK,
+                          "the tier's pick list must be as wide as the slot's");
+            static_assert(sizeof(((const CpuMoeBox*) nullptr)->x_q8) == (size_t) MAXT * q8_1_bytes(N),
+                          "the tier must be handed the card's own activation bytes");
+            for (int ll = 0; ll < NL; ++ll) {
+                std::string ferr;
+                strata::ds4::gguf::IqCpu f;
+                if (strata::ds4::gguf::gg_cpu_fmt((int) w.L[(size_t) ll].gu_e.type, (int) w.L[(size_t) ll].down_e.type, N, ff_slice, f, ferr)) {
+                    if (f.act_bytes > ACT_BYTES_MAX || f.h_bytes > HQ_BYTES_MAX || (size_t) ff_slice > FF_FLOATS_MAX) {
+                        if (c == 0)
+                            std::fprintf(stderr,
+                                         "fnx: CPU MoE layer %d off: needs act %zu B / ff %d floats / h %zu B, the pool holds "
+                                         "%zu / %zu / %zu%c",
+                                         ll, f.act_bytes, ff_slice, f.h_bytes, ACT_BYTES_MAX, FF_FLOATS_MAX, HQ_BYTES_MAX, 10);
+                    } else {
+                        fmts[(size_t) ll] = f;
+                        fmt_ok[(size_t) ll] = true;
+                    }
+                } else if (c == 0 && ll == 0) {
+                    std::fprintf(stderr, "fnx: CPU MoE fmt warning: %s%c", ferr.c_str(), 10);
+                }
+            }
+            std::string wait_policy = tpopt::wait_policy_text();
+            std::fprintf(stderr, "fnx: card %d CPU Hybrid TP worker started (%d threads, ff_slice=%d, wait=%s)%c", c, n_threads, ff_slice,
+                         wait_policy.c_str(), 10);
+            struct PersistentPool {
+                std::atomic<unsigned long long> phase1_id{0};
+                std::atomic<unsigned long long> phase2_id{0};
+                // rev.14: the two parkable waits. The futex syscall only takes a 32 bit word, so the workers sleep here
+                // rather than on the 64 bit phase counters; the manager publishes this slot right after each counter.
+                tpopt::WaitSlot p1_slot;
+                tpopt::WaitSlot p2_slot;
+                std::atomic<int> next_gu_task{0};
+                std::atomic<int> next_dn_task{0};
+                std::atomic<int> p1_done{0};
+                std::atomic<int> p2_done{0};
+                int total_items = 0;
+                int layer = 0;
+                int n_miss = 0;
+                int T = 1;
+                int gu_chunks_per_item = 1;
+                int dn_chunks_per_item = 1;
+                int slot_offsets[MAXT * TOPK + 1];
+                alignas(64) uint8_t shared_act[MAXT][ACT_BYTES_MAX];
+                alignas(64) float shared_ff[MAXT * TOPK][FF_FLOATS_MAX];
+                alignas(64) uint8_t shared_hq[MAXT * TOPK][HQ_BYTES_MAX];
+            };
+            auto* ppool = new PersistentPool();
+            std::memset(ppool->slot_offsets, 0, sizeof(ppool->slot_offsets));
+            constexpr int GU_STEP = 64;
+            constexpr int DN_STEP = 128;
+            for (int tid = 0; tid < n_threads; ++tid) {
+                std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, GU_STEP, DN_STEP]() {
+                    unsigned long long my_p1 = 0;
+                    unsigned long long my_p2 = 0;
+                    tpopt::HotWait p1_wait;
+                    while (true) {
+                        unsigned long long p1 = ppool->phase1_id.load(std::memory_order_acquire);
+                        if (p1 == my_p1) {
+                            // Nothing to do yet. rev.13 slept after ~1.1 ms of pausing, and that window fell short of the
+                            // real gap: the manager only advances phase1_id on layers that miss (engine.cu:512), so this
+                            // wait spans several layers and every miss event paid a ~0.5 ms wake-up. Pure pause reaches
+                            // 30.32 ms a round but burns a whole core per idle worker, which is what crossed the CPU quota
+                            // (nr_throttled +645). So: pause FNX_TP_HOT_US, then park on the slot - a parked worker costs
+                            // ~0.5% of a core and comes back in ~0.01 ms, so the window no longer has to cover the gap.
+                            tpopt::wait_for_work(ppool->p1_slot, p1_wait,
+                                                 [&] { return ppool->phase1_id.load(std::memory_order_seq_cst) != my_p1; });
+                            continue;
+                        }
+                        p1_wait.reset();
+                        my_p1 = p1;
+                        const int l = ppool->layer;
+                        const int n_miss = ppool->n_miss;
+                        const int total_items = ppool->total_items;
+                        const int gu_chunks = ppool->gu_chunks_per_item;
+                        const int total_gu_tasks = total_items * gu_chunks;
+                        if (l >= 0 && l < NL && n_miss > 0 && fmt_ok[(size_t) l]) {
+                            const auto& fmt = fmts[(size_t) l];
+                            const size_t half_gu = w.L[(size_t) l].gu_e_stride / 2;
+                            while (true) {
+                                int task = ppool->next_gu_task.fetch_add(1, std::memory_order_relaxed);
+                                if (task >= total_gu_tasks) break;
+                                const int idx = task / gu_chunks;
+                                const int c_idx = task % gu_chunks;
+                                const int r0 = c_idx * GU_STEP;
+                                const int r1 = std::min(ff_slice, r0 + GU_STEP);
+                                int m = 0;
+                                while (m + 1 < n_miss && ppool->slot_offsets[m + 1] <= idx) ++m;
+                                const int s = idx - ppool->slot_offsets[m];
+                                const int exp_id = hbox->miss_w[m];
+                                const int tok_y = hbox->miss_y[m][s];
+                                if (exp_id < 0 || exp_id >= NEXP || s < 0 || s >= MAXT || tok_y < 0 || tok_y >= MAXT ||
+                                    idx < 0 || idx >= MAXT * TOPK) continue;
+                                const size_t g_idx = (size_t) l * NEXP + exp_id;
+                                const uint8_t* gate_ptr = (const uint8_t*) w.cpu_host_gu[g_idx];
+                                const uint8_t* up_ptr = gate_ptr + half_gu;
+                                if (gate_ptr) {
+                                    const void* acts[1] = {ppool->shared_act[tok_y]};
+                                    float* ffs[1] = {ppool->shared_ff[idx]};
+                                    strata::ds4::gguf::gg_cpu_gate_up(fmt, gate_ptr, up_ptr, acts, 1, ffs, r0, r1, 0.0f);
+                                }
+                            }
+                        }
+                        ppool->p1_done.fetch_add(1, std::memory_order_release);
+
+                        // Wait for Phase 2 (Down projection across all threads): the same park as the phase-1 wait, so
+                        // a worker that is done with gate/up hands its CPU back instead of holding a core until the
+                        // manager finishes quantizing the intermediate.
+                        tpopt::HotWait p2_wait;
+                        while (ppool->phase2_id.load(std::memory_order_acquire) == my_p2) {
+                            tpopt::wait_for_work(ppool->p2_slot, p2_wait,
+                                                 [&] { return ppool->phase2_id.load(std::memory_order_seq_cst) != my_p2; });
+                        }
+                        my_p2 = ppool->phase2_id.load(std::memory_order_relaxed);
+                        const int dn_chunks = ppool->dn_chunks_per_item;
+                        const int total_dn_tasks = total_items * dn_chunks;
+                        if (l >= 0 && l < NL && n_miss > 0 && fmt_ok[(size_t) l]) {
+                            const auto& fmt = fmts[(size_t) l];
+                            while (true) {
+                                int task = ppool->next_dn_task.fetch_add(1, std::memory_order_relaxed);
+                                if (task >= total_dn_tasks) break;
+                                const int idx = task / dn_chunks;
+                                const int c_idx = task % dn_chunks;
+                                const int c0 = c_idx * DN_STEP;
+                                const int c1 = std::min(N, c0 + DN_STEP);
+                                int m = 0;
+                                while (m + 1 < n_miss && ppool->slot_offsets[m + 1] <= idx) ++m;
+                                const int exp_id = hbox->miss_w[m];
+                                if (exp_id < 0 || exp_id >= NEXP || idx < 0 || idx >= MAXT * TOPK) continue;
+                                const size_t g_idx = (size_t) l * NEXP + exp_id;
+                                const uint8_t* down_ptr = (const uint8_t*) w.cpu_host_dn[g_idx];
+                                float* out_p = hbox->y_out + (size_t) idx * N;
+                                if (down_ptr) {
+                                    const void* hqs[1] = {ppool->shared_hq[idx]};
+                                    float* outs[1] = {out_p};
+                                    strata::ds4::gguf::gg_cpu_down(fmt, down_ptr, hqs, 1, outs, c0, c1);
+                                } else {
+                                    std::memset(out_p + c0, 0, (size_t) (c1 - c0) * sizeof(float));
+                                }
+                            }
+                        }
+                        ppool->p2_done.fetch_add(1, std::memory_order_release);
+                    }
+                }).detach();
+            }
+            // The tier card's worker beside the host one (l2_dec.hpp). The router sorted this window's picks three ways,
+            // so the cards, the tier and the host worker each answer a disjoint part of the same window at the same
+            // time; opening it here, per card, is what hands this card's box to that worker. False keeps decode exactly
+            // as it was: no extra kernel, no extra event, no extra thread.
+            const bool l2_dec_on = l2::dec::open(c, m, hbox);
+            tpopt::WaitSlot* l2dec_wake = l2_dec_on ? l2::dec::wake() : nullptr;
+            b->l2_dec_on = l2_dec_on;
+            b->l2_dec_map = l2_dec_on ? l2::dec::map(c) : nullptr;
+            std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, n_threads, GU_STEP, DN_STEP, l2dec_wake]() {
+                unsigned long long last_seq = 0;
+                tpopt::HotWait mgr_wait;
+                while (true) {
+                    unsigned long long cur = *(volatile const unsigned long long*) &hbox->req_seq;
+                    if (cur == last_seq) {
+                        // Nobody can wake this one: req_seq is written from the CUDA side, so there is no publish to hook
+                        // a futex onto. Pause through a whole decode (FNX_TP_IDLE_US, default 20 ms, is far above the
+                        // ~1.2 ms between miss events) and only sleep once the request stream has really stopped; that is
+                        // 0.000 ms added while there is work and no core held while there is not (out/_work/probe3_rev14_v0b.txt).
+                        tpopt::wait_for_progress(mgr_wait);
+                        continue;
+                    }
+                    mgr_wait.reset();
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    if (l2dec_wake)
+                        tpopt::publish(*l2dec_wake);   // the tier's worker waits on a slot only this thread can reach
+                    const int n_miss = std::min(std::max(hbox->n_miss, 0), MAXT * TOPK);   // the slot table's capacity
+                    const int l = hbox->layer;
+                    const int T_cur = std::max(1, std::min(MAXT, hbox->T));
+                    if (n_miss > 0 && l >= 0 && l < NL && fmt_ok[(size_t) l]) {
+                        const auto& fmt = fmts[(size_t) l];
+                        ppool->layer = l;
+                        ppool->n_miss = n_miss;
+                        ppool->T = T_cur;
+                        ppool->slot_offsets[0] = 0;
+                        bool tok_used[MAXT] = {};
+                        for (int m = 0; m < n_miss; ++m) {
+                            ppool->slot_offsets[m + 1] = ppool->slot_offsets[m] + hbox->miss_n[m];
+                            for (int s = 0; s < hbox->miss_n[m]; ++s) {
+                                int ty = hbox->miss_y[m][s];
+                                if (ty >= 0 && ty < T_cur) tok_used[ty] = true;
+                            }
+                        }
+                        for (int ty = 0; ty < T_cur; ++ty) {
+                            if (tok_used[ty]) {
+                                strata::ds4::gguf::gg_cpu_quant(fmt.gu_act, hbox->x_in + (size_t) ty * N, N, ppool->shared_act[ty]);
+                            }
+                        }
+                        // the miss jobs are at most T x TOPK pairs, so this fits by construction; a wider model would
+                        // stop at the pool's slots (and zero their rows below) rather than write past them
+                        const int want_items = ppool->slot_offsets[n_miss];
+                        const int total_items = want_items > MAXT * TOPK ? MAXT * TOPK : want_items;
+                        if (want_items > MAXT * TOPK)
+                            std::fprintf(stderr, "fnx: CPU Hybrid TP: %d miss items over the pool's %d slots, the rest get zero%c",
+                                         want_items, MAXT * TOPK, 10);
+                        ppool->total_items = total_items;
+                        ppool->gu_chunks_per_item = (ff_slice + GU_STEP - 1) / GU_STEP;
+                        ppool->dn_chunks_per_item = (N + DN_STEP - 1) / DN_STEP;
+
+                        // Launch Phase 1 (Parallel Gate/Up across all threads)
+                        ppool->next_gu_task.store(0, std::memory_order_relaxed);
+                        ppool->p1_done.store(0, std::memory_order_relaxed);
+                        // seq_cst rather than release: wait_for_work() pairs a seq_cst read of this counter with the
+                        // waiters registration inside publish(), and that single total order is what makes a lost wake-up
+                        // impossible. On x86 the locked RMW is already a full barrier, so the change costs nothing.
+                        ppool->phase1_id.fetch_add(1, std::memory_order_seq_cst);
+                        tpopt::publish(ppool->p1_slot);
+                        // the barrier is the one wait in this loop that can hang forever (a worker that never comes back),
+                        // so it is armed like the card waits: pause then a 1 ms timer once FNX_TP_IDLE_US passes, so a
+                        // throttled waiter still leaves CPU to the workers that do have work, and the watchdog so a
+                        // barrier that never closes says which one and exits non-zero
+                        tpopt::HotWait p1_barrier;
+                        tpopt::WaitGuard guard("the CPU Hybrid TP phase-1 barrier");
+                        while (ppool->p1_done.load(std::memory_order_acquire) < n_threads) {
+                            tpopt::wait_for_progress(p1_barrier);
+                        }
+
+                        // Quantize intermediate ff_slice for each item
+                        for (int idx = 0; idx < total_items; ++idx) {
+                            strata::ds4::gguf::gg_cpu_quant(fmt.d_act, ppool->shared_ff[idx], ff_slice, ppool->shared_hq[idx]);
+                        }
+
+                        // Launch Phase 2 (Parallel Down across all threads)
+                        ppool->next_dn_task.store(0, std::memory_order_relaxed);
+                        ppool->p2_done.store(0, std::memory_order_relaxed);
+                        ppool->phase2_id.fetch_add(1, std::memory_order_seq_cst);
+                        tpopt::publish(ppool->p2_slot);
+                        tpopt::HotWait p2_barrier;
+                        tpopt::WaitGuard guard2("the CPU Hybrid TP phase-2 barrier");
+                        while (ppool->p2_done.load(std::memory_order_acquire) < n_threads) {
+                            tpopt::wait_for_progress(p2_barrier);
+                        }
+                    }
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    *(volatile unsigned long long*) &hbox->done_seq = cur;
+                    last_seq = cur;
+                }
+            }).detach();
+        }
         cb_.push_back(b);
     }
     // every link carries a probe's stores before the ring's (src/peer_probe.hpp): one that drops them stops the engine
     // here, named, instead of in the first window's ring; a slow one is said and the engine goes on
-    std::fprintf(stderr, "fnx: HOSTRING build: the cards exchange through page-locked host memory; peer access is never enabled, "
-                         "no peer probe, IOMMU and BAR1 checks skipped\n");
+    std::fprintf(stderr, "fnx: NVLink P2P Direct Exchange build: cards exchange directly through device memory over NVLink bridge (P2P=%s)%c", peer_on ? "ON" : "OFF", 10);
     for (int c = 0; c < NCARD; ++c) {
         cb_[c]->ring.next_in = cb_[(c + 1) % NCARD]->ring.in;
         cb_[c]->ring.next_ag = cb_[(c + 1) % NCARD]->ring.ag;
@@ -951,7 +1283,8 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     const bool live = cache_live() && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
+                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, b.d_cpu_box,
+                 b.l2_dec_map, b.l2_dec_on ? b.xq : nullptr, l2::dec::cap());
     if (const int l = lyr; l >= 0 && l < NL) {
         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
@@ -971,6 +1304,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     else moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
     moe_down(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
+    if (b.d_cpu_box) cpu_moe_merge(b.d_cpu_box, b.part, b.st);
     RingMoe m;
     m.part = b.part;
     m.topw = b.topw;

@@ -43711,6 +43711,138 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_TP_CPU_PCT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/tpopt/tp_opt.hpp",
+     "line": 126,
+     "backend": "cuda-hip",
+     "fn": "env_num"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "env_num(\"FNX_CPU_PCT\", 50.0)",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4828e57253",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "4828e57253",
+   "last_date": "2026-11-24",
+   "status": "research",
+   "owner": "",
+   "note": "CPU utilization cap percentage (<=50%) for TP worker scheduling.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_TP_MEM_CAP_GIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/tpopt/tp_opt.hpp",
+     "line": 74,
+     "backend": "cuda-hip",
+     "fn": "env_num"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "env_num(\"FNX_RAM_LIMIT_GB\", 56.0)",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4828e57253",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "4828e57253",
+   "last_date": "2026-11-24",
+   "status": "research",
+   "owner": "",
+   "note": "Host system memory cap in GiB (<=56 GiB) for TP engine allocation.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_TP_VRAM_PCT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/tpopt/tp_opt.hpp",
+     "line": 57,
+     "backend": "cuda-hip",
+     "fn": "env_num"
+    }
+   ],
+   "parse": "float",
+   "default_state": null,
+   "code_default": "80.0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4828e57253",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "4828e57253",
+   "last_date": "2026-11-24",
+   "status": "research",
+   "owner": "",
+   "note": "Per-GPU VRAM budget percentage cap (keeping RTX 5070 L2 tier <=8 GB).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_TP_WAIT_MODE",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "engine/src/tpopt/tp_opt.hpp",
+     "line": 213,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "4828e57253",
+   "first_date": "2026-11-24",
+   "since": null,
+   "last_commit": "4828e57253",
+   "last_date": "2026-11-24",
+   "status": "rollback",
+   "owner": "",
+   "note": "Escape hatch to restore rev.13 spin-wait mode (value='spin'; fallback for FNX_TP_WAIT_MODE) in engine/src/tpopt/tp_opt.hpp:208-215.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_TQP_AVX2_FAST",
    "backends": [
     "cpu"
