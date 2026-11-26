@@ -114,6 +114,7 @@ void read_done(int card, int k, void* st);
 // FNX_L2_PF_TIMING: one line for the pass that has just finished, with the tier's copy / GEMM / slot-fill / pull time.
 // Nothing is recorded, and no line printed, unless the knob asked; a run that did not pays nothing at all.
 void timing_report();
+void end_pass();
 
 }  // namespace pf
 }  // namespace l2

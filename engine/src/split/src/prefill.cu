@@ -1501,6 +1501,9 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     int pf_rows = 0;
     for (const PfChunk& ck : chunks) pf_rows = std::max(pf_rows, (int) ck.tokens.size());
     bool pf_tier = false;
+    struct L2PfPassGuard {
+        ~L2PfPassGuard() { l2::pf::end_pass(); }
+    } l2_pf_pass_guard;
     if (staging) {
     each([&](int, CardBuf& b, const CardW& w, Pf& p) {
         ckc(cudaMemcpyAsync(p.slot_h, w.ec.slot_of, (size_t) NL * NEXP * sizeof(int), cudaMemcpyDeviceToHost, b.st), "slots");
@@ -1795,7 +1798,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 cudaStream_t s = b.st;
                 const int P = C * TOPK, ffs = w.ff1 - w.ff0;
                 const int pf_k = l * nk + j;
-                if (c == 0) l2::pf::wait_xread(pf_k, s);   // the tier may still be reading the rows it copied last step
+                if (pf_tier && c == 0) l2::pf::wait_xread(pf_k, s);   // the tier may still be reading the rows it copied last step
                 DW gu_e = L.gu_e, down_e = L.down_e;
                 if (staging) {
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
@@ -1808,10 +1811,10 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 // after the top-k lets 21 MiB cross while card 0 runs the router, the top-k, the count and its job
                 // tables - the copy reads only what the hc read above wrote (xh), so it is ready by now.
                 // FNX_L2_PF_EARLY_IN=0 marks nothing here; both marks then go at record_pairs, just after the top-k
-                if (c == 0) l2::pf::record_rows(pf_k, s);
+                if (pf_tier && c == 0) l2::pf::record_rows(pf_k, s);
                 pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
                 k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
-                if (c == 0) l2::pf::record_pairs(pf_k, s);   // the tier masks its own weights from these numbers
+                if (pf_tier && c == 0) l2::pf::record_pairs(pf_k, s);   // the tier masks its own weights from these numbers
                 ckc(cudaMemsetAsync(p.cnt, 0, NEXP * 4, s), "cnt");
                 k_pf_count<<<(P + 255) / 256, 256, 0, s>>>(p.topi, P, p.cnt);
                 if (b.route_cnt) route_count(p.topi, P, b.route_cnt + (size_t) (NL + l) * NEXP, s);
@@ -1842,14 +1845,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 m.part = p.part;
                 m.topw = pf_run ? p.topwm : p.topw;
                 m.logits = p.logits;
-                l2::pf::set_add(m, l2::pf::collect(c, l, l * nk + j, C, b.st));   // null unless this layer went to the tier
+                if (pf_tier) l2::pf::set_add(m, l2::pf::collect(c, l, l * nk + j, C, b.st));   // null unless this layer went to the tier
                 if (p.ring_sm) ring_sum(p.ring, p.bo_f, C, (const unsigned*) (p.ctl + 1), 2 * l + 1, b.st, m);
                 else if (p.overlap) ring_async(c, b, p, p.bo_f, &m, j, p.ev_rf[j], C, hs && l >= PLE_LAYER);
                 else pf_ring(p, c, p.bo_f, C, &m, b.ring.err, b.st);
                 // the sum that just got enqueued on this card's stream is what reads the tier's rows (kernels.cu:876,
                 // and k_pfr_addend above them), so say so now and let the tier's lane land the next addend in this
                 // landing slot meanwhile; nothing else in the pass frees it (l2_pf.hpp's read_done)
-                if (m.add || m.add_h) l2::pf::read_done(c, l * nk + j, b.st);
+                if (pf_tier && (m.add || m.add_h)) l2::pf::read_done(c, l * nk + j, b.st);
             });
         }
     }
@@ -1899,7 +1902,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     // FNX_L2_PF_TIMING: the tier's own line for this pass, once every card's stream is over (which is after every
     // addend, and so after every tier launch). Prints nothing at all unless the knob asked, and comes before the ring
     // error so a pass that failed still says where its time went.
-    l2::pf::timing_report();
+    if (pf_tier) l2::pf::timing_report();
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
     if (mtp_ && draft8)

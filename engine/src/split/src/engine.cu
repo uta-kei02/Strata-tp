@@ -534,21 +534,22 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
             b->l2_dec_map = l2_dec_on ? l2::dec::map(c) : nullptr;
             std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, n_threads, GU_STEP, DN_STEP, l2dec_wake]() {
                 unsigned long long last_seq = 0;
+                unsigned long long last_l2_seq = 0;
                 tpopt::HotWait mgr_wait;
                 while (true) {
                     unsigned long long cur = *(volatile const unsigned long long*) &hbox->req_seq;
-                    if (cur == last_seq) {
-                        // Nobody can wake this one: req_seq is written from the CUDA side, so there is no publish to hook
-                        // a futex onto. Pause through a whole decode (FNX_TP_IDLE_US, default 20 ms, is far above the
-                        // ~1.2 ms between miss events) and only sleep once the request stream has really stopped; that is
-                        // 0.000 ms added while there is work and no core held while there is not (out/_work/probe3_rev14_v0b.txt).
+                    unsigned long long cur_l2 = l2dec_wake ? *(volatile const unsigned long long*) &hbox->l2_req_seq : 0ULL;
+                    if (cur == last_seq && cur_l2 == last_l2_seq) {
                         tpopt::wait_for_progress(mgr_wait);
                         continue;
                     }
                     mgr_wait.reset();
                     std::atomic_thread_fence(std::memory_order_seq_cst);
-                    if (l2dec_wake)
+                    if (l2dec_wake && cur_l2 != last_l2_seq) {
+                        last_l2_seq = cur_l2;
                         tpopt::publish(*l2dec_wake);   // the tier's worker waits on a slot only this thread can reach
+                    }
+                    if (cur == last_seq) continue;
                     const int n_miss = std::min(std::max(hbox->n_miss, 0), MAXT * TOPK);   // the slot table's capacity
                     const int l = hbox->layer;
                     const int T_cur = std::max(1, std::min(MAXT, hbox->T));

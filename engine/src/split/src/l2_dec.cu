@@ -249,9 +249,10 @@ void worker() {
         bool any = false;
         for (int t = 0; t < NCARD; ++t) {
             if (!g.card[t].box) continue;   // attached later, while its card was still being built
-            const unsigned long long cur = *(volatile const unsigned long long*) &g.card[t].box->req_seq;
+            const unsigned long long cur = *(volatile const unsigned long long*) &g.card[t].box->l2_req_seq;
             if (cur == g.card[t].last) continue;
             g.card[t].last = cur;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             if (g.dead) {
                 zero_rows(g.card[t]);
                 answer(g.card[t], cur);
@@ -267,7 +268,7 @@ void worker() {
         tpopt::wait_for_work(g.wake, hw, [&g] {
             for (int t = 0; t < NCARD; ++t) {
                 if (!g.card[t].box) continue;
-                if (*(volatile const unsigned long long*) &g.card[t].box->req_seq != g.card[t].last) return true;
+                if (*(volatile const unsigned long long*) &g.card[t].box->l2_req_seq != g.card[t].last) return true;
             }
             return false;
         });

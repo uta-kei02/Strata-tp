@@ -292,6 +292,7 @@ struct CpuMoeBox {
     volatile unsigned long long done_seq;
     // rev.15-M2b-2: the tier card's answer (l2_dec.hpp). Its own sequence, so a round whose picks the tier ran never
     // waits on the host worker's counter and the other way round; both count the same req_seq bumps.
+    volatile unsigned long long l2_req_seq;
     volatile unsigned long long l2_done_seq;
     int layer;
     int T;

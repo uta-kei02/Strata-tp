@@ -342,7 +342,8 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
     __syncthreads();
     if ((s_n_miss > 0 || s_n_l2 > 0) && e == 0) {
         __threadfence_system();
-        d_cpu_box->req_seq = d_cpu_box->req_seq + 1ULL;
+        if (s_n_miss > 0) d_cpu_box->req_seq = d_cpu_box->req_seq + 1ULL;
+        if (s_n_l2 > 0) d_cpu_box->l2_req_seq = d_cpu_box->l2_req_seq + 1ULL;
         __threadfence_system();
     }
 }
