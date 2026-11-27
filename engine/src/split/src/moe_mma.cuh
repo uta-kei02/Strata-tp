@@ -274,7 +274,10 @@ __device__ __forceinline__ void mma_884(float (&d)[8], unsigned a0, unsigned a1,
 }
 #endif
 
-#if FNX_ARCH >= 80 && !FNX_HIP
+// the device pass decides, not the build: a two-arch executable (STRATA_SPLIT_FAT_ARCHS) carries both a Turing and a
+// Blackwell pass of this kernel, and the floor FNX_ARCH names is the weaker of the two cards. Asking __CUDA_ARCH__
+// keeps the 2080 Ti on Volta's HMMA.884 while the 5070's own pass gets Ampere's wider product for free.
+#if !FNX_HIP && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 // d (16 x 8) += a (16 x 16, row-major) b (16 x 8, col-major): Ampere's HMMA.16816, f16 products with f32 accumulation. Lane (g = lane / 4,
 // t = lane % 4) holds a0 = (row g, k 2t..2t+1), a1 = (row g + 8, k 2t..), a2 = (row g, k 2t + 8..), a3 = (row g + 8, k 2t + 8..);
 // b0 = (k 2t..2t+1, column g), b1 = (k 2t + 8.., column g); d0 d1 = (row g, columns 2t, 2t + 1), d2 d3 = (row g + 8, same columns)
@@ -304,7 +307,8 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
     constexpr int MM_NT = PF_JOB / 16;   // token tiles of a job
     constexpr int WR = BM / 32, WT = MM_THREADS / 32 / WR, TT = MM_NT / WT, NP = BM / MM_PASS, LO = 16 * TT;
     static_assert(WR * WT == MM_THREADS / 32 && TT * WT == MM_NT && NP * MM_PASS == BM, "warp layout");
-#if FNX_ARCH < 80
+    // the floor card only: on the host there is no pass to lay out, and the wider path needs no such guarantee
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
     static_assert(PF_JOB == 64, "the m8n8k4 path is laid out for 64-row jobs");
 #endif
     const int ji = blockIdx.y;
@@ -332,7 +336,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
         for (int b = 0; b < TT; ++b)
 #pragma unroll
             for (int j = 0; j < 8; ++j) acc[a][b][j] = 0.f;
-#elif FNX_ARCH >= 80
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // the warp's 32 rows x 16 TT tokens on HMMA.16816 (mma_16816): 2 row tiles of 16 x 2 TT token tiles of 8; lane (g, t4) loads the
     // 32-bit operand pairs of the fragment layout above from the weight tile (rows) and the activation tile (tokens) in shared memory
     const int lane = threadIdx.x & 31, g = lane >> 2, t4 = lane & 3;
@@ -397,7 +401,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
                 for (int r = 0; r < 2; ++r)
 #pragma unroll
                     for (int t = 0; t < TT; ++t) acc[r][t] = mma_wmma12(a[r], b[t], acc[r][t]);
-#elif FNX_ARCH >= 80
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
                 uint32_t fa[2][4], fb[2 * TT][2];
 #pragma unroll
                 for (int r = 0; r < 2; ++r) {
@@ -459,7 +463,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
 #pragma unroll
             for (int j = 0; j < 8; ++j) d[FNX_WMMA_GFX11 ? 2 * j : j] = acc[r][t][j];
         }
-#elif FNX_ARCH >= 80
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     // a lane's accumulators of a 16 x 8 tile: rows g and g + 8, columns 2 t4 and 2 t4 + 1 (mma_16816)
     float* sob = so + (split ? tg * LO * SLD : tb * 16 * SLD) + rg * 32;   // the warp's rows, its first token
 #pragma unroll
