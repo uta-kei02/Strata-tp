@@ -57,7 +57,7 @@ M3（5070 を入口の 1 次キャッシュへ / 3 階層 2 段階スワップ�
 | 1 window が 5070 へ送る pick 上限（撤退ノブ） | `FNX_L2_DEC_MAX` | 0 = 上限なし |
 | Decode の L1/L2/L3 内訳（件数と host worker・5070 の ms、3 行/サンプル） | `FNX_DEC_STATS` | 0（off は分岐 1 回のみ） |
 | 1 サンプルにまとめる window 数 | `FNX_DEC_STATS_EVERY` | 2048 |
-| 5070 arena 常駐 expert の host 原本をロード後に返却（M3-1） | `FNX_L2_DROP_HOST` | 0（1 は arena + `FNX_L2_PF` + `FNX_L2_DEC` + 両 card の表が揃うときだけ発火。揃わなければ警告して off） |
+| 5070 arena 常駐 expert の host 原本をロード後に返却（M3-1） | `FNX_L2_DROP_HOST` | 0（1 は arena + `FNX_L2_PF` + `FNX_L2_DEC` + 両 card の表が揃うときだけ発火。揃わなければ警告して off。2 は 1軍 swap slot を持つ arena 常駐分も返す） |
 | chunked GDN（sub-chunk 幅は card の opt-in 共有メモリから自動選択） | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1（sm_75 は 16 列 = 57,988 B）/ 0 |
 | GDN 数値比較・時間計測 | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Prefill 失敗時の診断印字 | `FNX_PF_ERRDBG` | 0 |
