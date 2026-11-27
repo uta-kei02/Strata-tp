@@ -5,6 +5,7 @@
 #include "kernels.hpp"
 #include "l2_offload.hpp"
 #include "model.hpp"
+#include "dec_stats.hpp"
 
 #include <cuda_runtime.h>
 
@@ -172,6 +173,9 @@ void run(int t, unsigned long long cur) {
         // round with no picks leaves the rows to whoever has them.
         if (bad || n_l2 > 0) zero_rows(cd);
         ++cd.reqs;
+        // FNX_DEC_STATS (dec_stats.hpp): a round that ran nothing still cost the walk over its lists, so it is timed
+        // with zero jobs and zero rows. Off, this is a branch and nothing else.
+        if (fnx::dec_stats_on()) fnx::dec_stats_tier(t, tpopt::now_ns() - t0, 0, 0);
         answer(cd, cur);
         if (bad) {
             char why[192];
@@ -227,7 +231,14 @@ void run(int t, unsigned long long cur) {
         cd.rows += used;
     }
     ++cd.reqs;
-    cd.ms += (double) (tpopt::now_ns() - t0) / 1e6;
+    if (fnx::dec_stats_on()) {
+        const long long took = tpopt::now_ns() - t0;
+        cd.ms += (double) took / 1e6;
+        // what the tier actually ran: a round that reported an error answered with zeros, so it owns no rows here
+        fnx::dec_stats_tier(t, took, err ? 0 : njobs, err ? 0 : used);
+    } else {
+        cd.ms += (double) (tpopt::now_ns() - t0) / 1e6;
+    }
     stage(16, "the counter, so the card's merge may read the rows");
     answer(cd, cur);
     if (g.stats && cd.reqs % 512 == 0)
@@ -249,9 +260,10 @@ void worker() {
         bool any = false;
         for (int t = 0; t < NCARD; ++t) {
             if (!g.card[t].box) continue;   // attached later, while its card was still being built
-            const unsigned long long cur = *(volatile const unsigned long long*) &g.card[t].box->req_seq;
+            const unsigned long long cur = *(volatile const unsigned long long*) &g.card[t].box->l2_req_seq;
             if (cur == g.card[t].last) continue;
             g.card[t].last = cur;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
             if (g.dead) {
                 zero_rows(g.card[t]);
                 answer(g.card[t], cur);
@@ -267,7 +279,7 @@ void worker() {
         tpopt::wait_for_work(g.wake, hw, [&g] {
             for (int t = 0; t < NCARD; ++t) {
                 if (!g.card[t].box) continue;
-                if (*(volatile const unsigned long long*) &g.card[t].box->req_seq != g.card[t].last) return true;
+                if (*(volatile const unsigned long long*) &g.card[t].box->l2_req_seq != g.card[t].last) return true;
             }
             return false;
         });

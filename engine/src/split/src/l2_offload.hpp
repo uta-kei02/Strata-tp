@@ -55,6 +55,16 @@ struct Ctx {
     // copy is enough for M2a; M2b reads this to decide which experts the card computes instead of the host
     std::vector<long long> at;
 
+    // --- M3-1 (FNX_L2_DROP_HOST, off by default): the arena's experts no longer need their page-locked RAM copy.
+    //     drop_host() gives those bytes back and rewrites the cards' host mirrors and expert tables around what is
+    //     left, so the tier is the only place an arena expert's weight exists. `dropped` is the flag every other path
+    //     checks before it reads a host pointer that used to be there; false means nothing here was touched.
+    bool dropped = false;            // at least one host expert block was handed back
+    size_t freed = 0;                // page-locked bytes given back in total
+    int dropped_experts = 0;         // [NL * NEXP] entries whose RAM copy is gone (the same on every card)
+    double drop_seconds = 0;         // the compaction itself, so a slow knob is visible in the startup log
+    std::vector<unsigned char> dropped_entry;   // [NL * NEXP]: 1 = this entry has no host copy any more
+
     // --- the M3 hooks (docs/m2_design_rtx5070_l2.md sec.6): nothing writes them yet, so M2b/M2c stay as they are.
     //     They exist so M3's two-step gravity swap, and the demotion of a card's low-score slots onto this tier, do
     //     not have to reshape what M2b/M2c put in place.
@@ -70,6 +80,12 @@ const Ctx& ctx();
 // takes the requested card, fills it, checks it and prints one line (off: none). Never throws: every refusal leaves
 // the tier off and the run on the old path, because losing the spare card must not stop a server that works without it
 void setup(Model& m);
+
+// M3-1: hand the page-locked RAM copies of the arena's experts back, once the tier is up and both the prompt and the
+// decode path agree they will never be read. Off unless FNX_L2_DROP_HOST says otherwise, and every gate below is a
+// no: a run that does not ask for it (or that fails one gate) keeps every byte exactly where M2b-2 left it. Call it
+// after l2::setup / l2::pf::setup / l2::dec::open and before anything computes.
+void drop_host(Model& m);
 
 }  // namespace l2
 }  // namespace fnx

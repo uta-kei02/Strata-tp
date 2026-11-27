@@ -2232,7 +2232,7 @@ __global__ void __launch_bounds__(256) k_cpu_moe_merge(CpuMoeBox* box, float* pa
         // a round whose picks went to the tier never waits on the host worker and the other way round; a layer with
         // neither pays no wait at all, which is what keeps a captured graph replayable on a tier-less run.
         if (box->n_l2 > 0) {
-            const unsigned long long target = box->req_seq;
+            const unsigned long long target = box->l2_req_seq;
             while (*(volatile const unsigned long long*) &box->l2_done_seq < target) {
                 __nanosleep(64);
             }

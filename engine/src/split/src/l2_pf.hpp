@@ -58,7 +58,9 @@ void setup(Model& m, int max_rows);
 
 // which experts the tier computes for this pass (rows x nk chunks). Called once, before the pass builds its expert
 // tables, so the cards can leave those bytes in host RAM instead of copying them. False: the pass is today's
-bool plan(Model& m, int rows, int nk);
+// stream=false is M3-1's resident-only ask: a short prompt has no streaming slots to spare, but the tier still takes
+// what its arena holds so the cards never read a host copy that FNX_L2_DROP_HOST gave back. Nothing is streamed then.
+bool plan(Model& m, int rows, int nk, bool stream = true);
 
 bool take(size_t i);          // [NL * NEXP]: the tier computes this expert this pass
 bool layer_taken(int l);      // and this layer's worth of them fits
@@ -114,6 +116,7 @@ void read_done(int card, int k, void* st);
 // FNX_L2_PF_TIMING: one line for the pass that has just finished, with the tier's copy / GEMM / slot-fill / pull time.
 // Nothing is recorded, and no line printed, unless the knob asked; a run that did not pays nothing at all.
 void timing_report();
+void end_pass();
 
 }  // namespace pf
 }  // namespace l2

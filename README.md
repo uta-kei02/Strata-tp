@@ -25,6 +25,35 @@
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
+
+## This fork: Strata-tp
+
+This tree is a machine-specific fork of [Strata](https://github.com/Niko1221/Strata). Every added
+behaviour sits behind a switch that is off by default, so a plain install still behaves exactly like
+upstream. The engine diff, the check scripts and these notes are written by AI; what a human did was
+run the commands and collect the measured numbers.
+
+**How it differs from upstream**
+
+- **Turing (`sm_75`) tensor parallel over NVLink** - aimed at two modded RTX 2080 Ti 22 GB cards hung off
+  OCuLink (PCIe Gen3 x4): a custom NVLink P2P direct exchange, RCCL, and a CPU hybrid TP path that waits in
+  `futex park` instead of spinning on the GPU.
+- **A third, different GPU as the L2 expert tier (RTX 5070 / `sm_120`)** - Prefill is computed on the 5070 with
+  the `sm_120 HMMA.16816` streaming GEMM and fp16 addends (10K-class cold **1,418-1,432 tok/s**, `tier compute`
+  about 1,912 -> 279 ms); Decode classifies each MoE round once in the router into L1 / L2 / L3 and the arena
+  half is answered on the 5070; a short Prefill pass hands only its resident experts to the tier
+  (**5 tok fixed 509 ms -> 300 ms**).
+- **The Host pinned RAM copy of the arena comes back (`FNX_L2_DROP_HOST=1|2`)** - the page-locked Host originals of
+  the experts resident in the 5070 arena are returned after load, one layer at a time, so the peak stays flat
+  (**5.14-5.26 GiB returned**); on the 8010 production host `shared` fell 25 -> 20 GiB and `available` rose
+  10 -> 20 GiB. A tail pass too short to stream falls back onto the tier instead of reading a returned copy, and
+  that is what lets `MLOCK_MAX_GIB=10` fit inside 64 GB of RAM.
+- **The defaults do not move** - every added knob is off by default (and is not exported at all when the L2 tier
+  is absent), so upstream behaviour and the plain 2-card numbers stand unless a config asks for them.
+
+Switch table and measured history: [`README_tp_opt.en.md`](README_tp_opt.en.md) (English),
+[`README_tp_opt.md`](README_tp_opt.md) (Japanese).
+
 ## Models
 
 We recommend **ISTA-DASLab first**, then **Unsloth** and other providers, where a compatible model fits.

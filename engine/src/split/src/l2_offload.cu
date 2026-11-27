@@ -4,6 +4,8 @@
 
 #include "model.hpp"
 #include "../../tpopt/tp_opt.hpp"
+#include "l2_dec.hpp"
+#include "l2_pf.hpp"
 
 #include <cuda_runtime.h>
 
@@ -361,6 +363,304 @@ void setup(Model& m) {
                  c.skipped, c.seconds, c.h2d_pinned_gbs, c.h2d_pageable_gbs, c.d2h_gbs, want_test ? (c.selftest_ok ? "ok" : "FAILED") : "skipped",
                  hsum, c.stage_bytes >> 20);
     back();
+}
+
+// FNX_L2_DROP_HOST: for the experts the arena holds, the page-locked original in RAM buys nothing once both the
+// prompt path and decode ask the tier for them. Give those copies back and the same bytes go to the table lock
+// (MLOCK), whose misses are what a long decode round waits on. Safety comes from the tier then being the only place
+// these experts live, which every reader has to agree with:
+//   - decode: the router sends a pick that missed the first tier to the tier's box (moe.cuh:276-312), and only an
+//     expert with a slot of its own stays in this card's jobs, so no Turing kernel is handed one;
+//   - a long prompt: the same plan gives the tier these experts, and the cards read the host copy of an expert only
+//     where the tier left it to them (prefill.cu:1513-1550);
+//   - a short prompt: prefill.cu asks the tier for the resident ones alone (l2_pf::plan with stream=false);
+//   - a first-tier promotion: cache_plan skips an expert whose host original is gone (moe.cuh:87), so k_cache_copy
+//     never reads a null;
+//   - and l2_dec's retire() (l2_dec.cu:106) stays the one way an expert can go missing after this, which is the
+//     hole an expert outside the first tier was always allowed to be (the host worker answers 0 for it).
+// Value 1 hands back an arena expert that has no first-tier slot of its own. Value 2 also hands back the ones that
+// do keep a slot: their RAM copy is only the landing place for a demotion, and after a demotion the tier answers
+// them (the router sends a pick with no slot there), while cache_plan cannot promote them again. The arena is
+// about a fifth of the experts, so 2 buys several GiB more of MLOCK - at the price of one more of these agreements.
+// Two rounds: the first only reads the tables and checks the layout, so a card that does not match costs nothing.
+// The second walks the layers and, one layer at a time, reserves that layer's smaller block, moves the survivors
+// into it, republishes that layer's table rows and only then lets the old block go. One layer at a time is the
+// point: the peak is the old grid plus a single layer (about 0.23 GiB a card), where reserving every smaller block
+// up front asked for the whole new grid (21.66 GiB) on top of what was still locked, and that pushed the page
+// cache out and set off the kernel's out-of-memory killer. The layout check is the rest of the safety - the copy
+// and the free both assume model.cpp's block [entry 0 | entry 1 | ...] of exp_b bytes per layer, mapped as one
+// device pointer per block.
+void drop_host(Model& m)
+{
+    Ctx& c = shared();
+    const int what = env_int("FNX_L2_DROP_HOST", 0);
+    if (what == 0) return;
+    const bool also_slot = what >= 2;
+    const size_t nidx = (size_t) NL * NEXP;
+
+    const char* why = nullptr;
+    char detail[192] = {};
+    if (!c.ok || !c.arena || c.experts <= 0 || c.at.size() != nidx) {
+        std::snprintf(detail, sizeof(detail),
+                      "the tier's arena is not what this expects (ok %d, arena %s, experts %d, at %zu entries of %zu)",
+                      (int) c.ok, c.arena ? "set" : "null", c.experts, c.at.size(), nidx);
+        why = detail;
+    }
+    else if (m.arena) why = "FNX_ARENA lends these very slots to K/V";
+    else if (!pf::use()) why = "the prompt path is not on the tier (FNX_L2_PF=0)";
+    else if (!dec::map(0) || !dec::map(1)) why = "decode is not on the tier (FNX_CPU_MOE=0 / FNX_L2_DEC=0)";
+    else {
+        const int dcap = dec::cap();
+        if (dcap != 0 && dcap < MAXT * TOPK) why = "FNX_L2_DEC_MAX caps the tier below a whole window";
+        for (int card = 0; card < NCARD && !why; ++card) {
+            const CardW& cw = m.cards[card];
+            // two widths here, and mixing them up turns the gate off for every run: ec_owner0 is one entry per VRAM
+            // slot (model.cpp:372 sets n_slots to owner.size(), :399 hands that vector over), while the tables this
+            // function walks are one entry per expert. Say which array fell short, and with how many rows.
+            const char* bad = nullptr;
+            long long have = 0, want = (long long) nidx;
+            if (cw.ec.n_slots <= 0) { bad = "ec.n_slots"; have = cw.ec.n_slots; want = 1; }
+            else if (cw.ec_owner0.size() != (size_t) cw.ec.n_slots) {
+                bad = "ec_owner0"; have = (long long) cw.ec_owner0.size(); want = cw.ec.n_slots;
+            } else if (cw.ec_slot0.size() != nidx) { bad = "ec_slot0"; have = (long long) cw.ec_slot0.size(); }
+            else if (cw.ec_host_gu.size() != nidx) { bad = "ec_host_gu"; have = (long long) cw.ec_host_gu.size(); }
+            else if (cw.ec_host_dn.size() != nidx) { bad = "ec_host_dn"; have = (long long) cw.ec_host_dn.size(); }
+            else if (cw.cpu_host_gu.size() != nidx) { bad = "cpu_host_gu"; have = (long long) cw.cpu_host_gu.size(); }
+            else if (cw.cpu_host_dn.size() != nidx) { bad = "cpu_host_dn"; have = (long long) cw.cpu_host_dn.size(); }
+            else if (!cw.ec.ep_gu || !cw.ec.ep_dn || !cw.ec.host_gu || !cw.ec.host_dn) {
+                bad = "ec.ep_gu / ep_dn / host_gu / host_dn"; have = 0;
+            }
+            if (bad) {
+                std::snprintf(detail, sizeof(detail), "card %d reads %s with %lld rows where this expects %lld",
+                              card, bad, have, want);
+                why = detail;
+            }
+        }
+    }
+    if (why) {
+        std::fprintf(stderr, "fnx: l2: drop: off: %s\n", why);
+        return;
+    }
+
+    struct Card {
+        bool ok = false, wrote = false;
+        std::vector<char*> old_h, new_h;                   // per layer: the block, and the smaller one after it
+        std::vector<size_t> exp_b, seen, keep;
+        std::vector<unsigned char> gone;                   // [NL * NEXP]: this card gives this expert back
+        std::vector<const char*> ogu, o_dn, ohu, ohd;      // what its tables said, read back
+        int stopped = -1;                                  // the first layer this card could not move
+        size_t freed = 0;
+    };
+    Card cd[NCARD];
+    for (int card = 0; card < NCARD; ++card) {
+        Card& p = cd[card];
+        p.old_h.assign(NL, nullptr);
+        p.new_h.assign(NL, nullptr);
+        p.exp_b.assign(NL, 0);
+        p.seen.assign(NL, 0);
+        p.keep.assign(NL, 0);
+        p.gone.assign(nidx, 0);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+
+    // round 1: read the tables, check the layout, and remember which block each layer would replace. Nothing is
+    // reserved and nothing is published here, so a card that fails here costs nothing
+    std::thread th[NCARD];
+    for (int card = 0; card < NCARD; ++card)
+        th[card] = std::thread([&, card] {
+            Card& p = cd[card];
+            CardW& cw = m.cards[card];
+            p.ogu.assign(nidx, nullptr);
+            p.o_dn.assign(nidx, nullptr);
+            p.ohu.assign(nidx, nullptr);
+            p.ohd.assign(nidx, nullptr);
+            if (cudaSetDevice(cw.dev) != cudaSuccess) return;
+            if (cudaDeviceSynchronize() != cudaSuccess) return;  // the engine is between builds: nothing is in flight
+            if (cudaMemcpy(p.ogu.data(), cw.ec.ep_gu, nidx * sizeof(void*), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            if (cudaMemcpy(p.o_dn.data(), cw.ec.ep_dn, nidx * sizeof(void*), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            if (cudaMemcpy(p.ohu.data(), cw.ec.host_gu, nidx * sizeof(void*), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            if (cudaMemcpy(p.ohd.data(), cw.ec.host_dn, nidx * sizeof(void*), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            for (int l = 0; l < NL; ++l) {
+                const size_t gs = cw.L[l].gu_e_stride, ds = cw.L[l].down_e_stride;
+                if (gs == 0 || ds == 0) return;
+                const size_t eb = gs + ds;
+                // plan() only takes a layer's experts when both cards describe the layer's pool (l2_pf.cu:796-806).
+                // Without that the layer keeps every expert on the cards, and an expert whose RAM went back would be
+                // read from a null table entry - so a layer the tier cannot take gives nothing back either.
+                for (int t = 0; t < NCARD; ++t) {
+                    const CardW& ow = m.cards[(size_t) t];
+                    const int pp = ow.ec.pool_of[l];
+                    if (pp < 0 || pp >= EC_POOLS || ow.ec.slot_bytes[pp] <= ow.ec.dn_off[pp]) return;
+                }
+                char* ob = nullptr;
+                char* mb = nullptr;
+                size_t n_seen = 0, n_keep = 0;
+                for (int e = 0; e < NEXP; ++e) {
+                    const size_t i = (size_t) l * NEXP + e;
+                    const char* hp = cw.cpu_host_gu[i];
+                    if (!hp) continue;                                  // a slot's expert, or one with no copy
+                    if (!cw.cpu_host_dn[i]) return;
+                    if (!ob) {
+                        void* dm = nullptr;
+                        if (cudaHostGetDevicePointer(&dm, (void*) hp, 0) != cudaSuccess) return;
+                        ob = (char*) hp;
+                        mb = (char*) dm;
+                    }
+                    const size_t off = (size_t)(hp - ob);
+                    if (off % eb != 0) return;
+                    const size_t rk = off / eb;
+                    if (cw.cpu_host_dn[i] != hp + gs || p.ohu[i] != mb + rk * eb || p.ohd[i] != mb + rk * eb + gs) return;
+                    ++n_seen;
+                    // the arena holds it, so its RAM copy buys nothing; with value 2 that includes an expert that
+                    // also holds a swap slot, whose RAM copy only ever caught a demotion (the tier answers it after)
+                    if (c.at[i] >= 0 && (also_slot || cw.ec_slot0[i] < 0)) { p.gone[i] = 1; continue; }
+                    ++n_keep;
+                }
+                p.exp_b[l] = eb;
+                p.seen[l] = n_seen;
+                p.keep[l] = n_keep;
+                if (ob && n_keep < n_seen) p.old_h[l] = ob;   // round 2 replaces this layer's block with a smaller one
+            }
+            p.ok = true;
+        });
+    for (int card = 0; card < NCARD; ++card) th[card].join();
+
+    bool all = true;
+    for (int card = 0; card < NCARD; ++card) all = all && cd[card].ok;
+    if (!all) {
+        // round 1 locked nothing and published nothing, so there is nothing to undo
+        std::fprintf(stderr, "fnx: l2: drop: off: a card's host blocks are not the layout this expects\n");
+        return;
+    }
+
+    // round 2, one layer at a time: reserve this layer's smaller block, move the survivors, republish this layer's
+    // four table rows over the old ones, and only then let the old block go. Nothing on the host side of a card
+    // (cpu_host_*, ec_host_*) moves before its rows have landed, so a layer this card stops at is still the layer
+    // it was: old block alive, old table rows, old mirrors. The tables keep their base address, so model.cpp's
+    // cached rows (model.cpp:414-415), every captured graph and both mirrors keep reading the same array.
+    for (int card = 0; card < NCARD; ++card)
+        th[card] = std::thread([&, card] {
+            Card& p = cd[card];
+            CardW& cw = m.cards[card];
+            if (cudaSetDevice(cw.dev) != cudaSuccess) return;
+            // one layer of the six tables, filled here and pushed with four copies; the last two rows are what this
+            // card's own host side will hold, and they go in only once the first four have landed
+            std::vector<const char*> row_gu(NEXP), row_dn(NEXP), row_hgu(NEXP), row_hdn(NEXP);
+            std::vector<char*> row_cg(NEXP), row_cd(NEXP);
+            for (int l = 0; l < NL; ++l) {
+                char* ob = p.old_h[l];
+                if (!ob) continue;                                   // this layer has nothing to give back
+                const size_t eb = p.exp_b[l], gs = cw.L[l].gu_e_stride, keep = p.keep[l];
+                char* nh = nullptr;
+                void* dm = nullptr;
+                if (cudaHostAlloc((void**) &nh, keep * eb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
+                    p.stopped = l;
+                    break;
+                }
+                if (cudaHostGetDevicePointer(&dm, (void*) nh, 0) != cudaSuccess) {
+                    cudaFreeHost(nh);                                // nothing points at it yet
+                    p.stopped = l;
+                    break;
+                }
+                size_t out = 0;
+                for (int e = 0; e < NEXP; ++e) {
+                    const size_t i = (size_t) l * NEXP + e;
+                    row_gu[e] = p.ogu[i];
+                    row_dn[e] = p.o_dn[i];
+                    row_hgu[e] = p.ohu[i];
+                    row_hdn[e] = p.ohd[i];
+                    row_cg[e] = (char*) cw.cpu_host_gu[i];
+                    row_cd[e] = (char*) cw.cpu_host_dn[i];
+                    if (!cw.cpu_host_gu[i]) continue;                              // a slot's expert, or one with no copy
+                    if (p.gone[i]) {
+                        row_hgu[e] = row_hdn[e] = nullptr;
+                        row_cg[e] = row_cd[e] = nullptr;
+                        continue;
+                    }
+                    const size_t rk = (size_t)(cw.cpu_host_gu[i] - ob) / eb;
+                    std::memcpy(nh + out * eb, ob + rk * eb, eb);
+                    const char* mg = (const char*) dm + out * eb;
+                    const char* md = mg + gs;
+                    if (p.ogu[i] == p.ohu[i]) row_gu[e] = mg;        // it was read from RAM, so it follows the copy
+                    if (p.o_dn[i] == p.ohd[i]) row_dn[e] = md;
+                    row_hgu[e] = mg;
+                    row_hdn[e] = md;
+                    row_cg[e] = nh + out * eb;
+                    row_cd[e] = nh + out * eb + gs;
+                    ++out;
+                }
+                if (out != keep) {
+                    cudaFreeHost(nh);
+                    p.stopped = l;
+                    break;
+                }
+                const auto push = [&](const void* from, void* into) {
+                    return cudaMemcpy(into, from, NEXP * sizeof(void*), cudaMemcpyHostToDevice) == cudaSuccess;
+                };
+                bool pub = push(row_gu.data(), (void*) (cw.ec.ep_gu + (size_t) l * NEXP)) &&
+                           push(row_dn.data(), (void*) (cw.ec.ep_dn + (size_t) l * NEXP)) &&
+                           push(row_hgu.data(), (void*) (cw.ec.host_gu + (size_t) l * NEXP)) &&
+                           push(row_hdn.data(), (void*) (cw.ec.host_dn + (size_t) l * NEXP));
+                if (!pub) {
+                    // the rows did not land, so the old block is still what the cards read. Keep both blocks: the
+                    // survivors are already in the new one, and freeing the old would pull the table's target out
+                    p.new_h[l] = nh;
+                    p.stopped = l;
+                    break;
+                }
+                // the layer reads the new block on both sides now: the mirrors first, then the old block may go
+                for (int e = 0; e < NEXP; ++e) {
+                    const size_t i = (size_t) l * NEXP + e;
+                    cw.cpu_host_gu[i] = row_cg[e];
+                    cw.cpu_host_dn[i] = row_cd[e];
+                    cw.ec_host_gu[i] = row_hgu[e];
+                    cw.ec_host_dn[i] = row_hdn[e];
+                }
+                cudaFreeHost(ob);
+                p.old_h[l] = nullptr;
+                p.new_h[l] = nh;
+                p.freed += (p.seen[l] - keep) * eb;
+            }
+            if (p.stopped >= 0) {
+                // a layer this card never published still holds every expert of its own, so only what really went
+                // back may be called dropped
+                for (size_t i = (size_t) p.stopped * NEXP; i < nidx; ++i) p.gone[i] = 0;
+            }
+            if (p.freed > cw.host_bytes) p.freed = cw.host_bytes;
+            cw.host_bytes -= p.freed;
+            cudaDeviceSynchronize();
+            p.wrote = true;
+        });
+    for (int card = 0; card < NCARD; ++card) th[card].join();
+
+    size_t freed = 0;
+    int gone = 0, with_slot = 0, cards = 0;
+    c.dropped_entry.assign(nidx, 0);
+    for (size_t i = 0; i < nidx; ++i) {
+        bool all_gone = true, all_slot = true;
+        for (int card = 0; card < NCARD; ++card) {
+            all_gone = all_gone && cd[card].gone[i];
+            all_slot = all_slot && (m.cards[card].ec_slot0[i] >= 0);
+        }
+        if (all_gone) {
+            c.dropped_entry[i] = 1;
+            ++gone;
+            if (all_slot) ++with_slot;
+        }
+    }
+    for (int card = 0; card < NCARD; ++card)
+        if (cd[card].wrote) { freed += cd[card].freed; ++cards; }
+    c.drop_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    c.dropped = gone > 0 && cards == NCARD;
+    c.freed = freed;
+    c.dropped_experts = gone;
+    std::fprintf(stderr,
+                 "fnx: l2: drop: %d experts gave their RAM copies back: %.2f GiB off the host (%d of %d cards, %.2f s), "
+                 "%d of them still with a first-tier slot: the arena is where their weights live now\n",
+                 gone, (double) freed / GIB, cards, (int) NCARD, c.drop_seconds, with_slot);
+    for (int card = 0; card < NCARD; ++card)
+        std::fprintf(stderr, "fnx: l2: drop: card %d %s: %.2f GiB back, %.2f GiB of copies left\n", card,
+                     cd[card].wrote ? "gave" : "kept", (double) cd[card].freed / GIB, (double) m.cards[card].host_bytes / GIB);
 }
 
 }  // namespace l2

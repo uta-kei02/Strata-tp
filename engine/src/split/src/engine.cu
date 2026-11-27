@@ -7,6 +7,8 @@
 #include "peer_probe.hpp"
 #include "pf_pick.hpp"
 #include "l2_dec.hpp"
+#include "l2_offload.hpp"
+#include "dec_stats.hpp"
 
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -532,26 +534,38 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
             tpopt::WaitSlot* l2dec_wake = l2_dec_on ? l2::dec::wake() : nullptr;
             b->l2_dec_on = l2_dec_on;
             b->l2_dec_map = l2_dec_on ? l2::dec::map(c) : nullptr;
-            std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, n_threads, GU_STEP, DN_STEP, l2dec_wake]() {
+            // FNX_DEC_STATS (dec_stats.hpp): M3-2's ruler for the three-way split. Read once per card here, so the
+            // environment is looked at once at start-up instead of once per window, and off costs one captured bool.
+            const bool ds = fnx::dec_stats_on();
+            std::thread([hbox, &w, fmts, fmt_ok, ff_slice, ppool, n_threads, GU_STEP, DN_STEP, l2dec_wake, c, ds]() {
                 unsigned long long last_seq = 0;
+                unsigned long long last_l2_seq = 0;
                 tpopt::HotWait mgr_wait;
                 while (true) {
                     unsigned long long cur = *(volatile const unsigned long long*) &hbox->req_seq;
-                    if (cur == last_seq) {
-                        // Nobody can wake this one: req_seq is written from the CUDA side, so there is no publish to hook
-                        // a futex onto. Pause through a whole decode (FNX_TP_IDLE_US, default 20 ms, is far above the
-                        // ~1.2 ms between miss events) and only sleep once the request stream has really stopped; that is
-                        // 0.000 ms added while there is work and no core held while there is not (out/_work/probe3_rev14_v0b.txt).
+                    unsigned long long cur_l2 = l2dec_wake ? *(volatile const unsigned long long*) &hbox->l2_req_seq : 0ULL;
+                    if (cur == last_seq && cur_l2 == last_l2_seq) {
                         tpopt::wait_for_progress(mgr_wait);
                         continue;
                     }
                     mgr_wait.reset();
                     std::atomic_thread_fence(std::memory_order_seq_cst);
-                    if (l2dec_wake)
+                    if (l2dec_wake && cur_l2 != last_l2_seq) {
+                        last_l2_seq = cur_l2;
                         tpopt::publish(*l2dec_wake);   // the tier's worker waits on a slot only this thread can reach
+                    }
+                    // The ruler reads the box after the tier has been woken, so it can never delay that wake-up, and
+                    // before the shortcut below, so a window whose picks all went to the tier still gets counted.
+                    // That is the split M3-2 is after: this thread is the only one that reads both request counters.
+                    if (ds) fnx::dec_stats_window(c, hbox);
+                    if (cur == last_seq) continue;
                     const int n_miss = std::min(std::max(hbox->n_miss, 0), MAXT * TOPK);   // the slot table's capacity
                     const int l = hbox->layer;
                     const int T_cur = std::max(1, std::min(MAXT, hbox->T));
+                    // the four spans dec_stats_host() wants, seeded to the window's start so a window with no L3 pick
+                    // reports four zeros instead of a negative slice; off leaves all five at zero and changes nothing
+                    long long ds_t0 = 0, ds_q = 0, ds_gu = 0, ds_hq = 0, ds_dn = 0;
+                    if (ds) ds_t0 = ds_q = ds_gu = ds_hq = ds_dn = tpopt::now_ns();
                     if (n_miss > 0 && l >= 0 && l < NL && fmt_ok[(size_t) l]) {
                         const auto& fmt = fmts[(size_t) l];
                         ppool->layer = l;
@@ -571,6 +585,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
                                 strata::ds4::gguf::gg_cpu_quant(fmt.gu_act, hbox->x_in + (size_t) ty * N, N, ppool->shared_act[ty]);
                             }
                         }
+                        if (ds) ds_q = tpopt::now_ns();   // the rows this card's misses need, quantized for the experts
                         // the miss jobs are at most T x TOPK pairs, so this fits by construction; a wider model would
                         // stop at the pool's slots (and zero their rows below) rather than write past them
                         const int want_items = ppool->slot_offsets[n_miss];
@@ -599,11 +614,13 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
                         while (ppool->p1_done.load(std::memory_order_acquire) < n_threads) {
                             tpopt::wait_for_progress(p1_barrier);
                         }
+                        if (ds) ds_gu = tpopt::now_ns();   // gate|up across the pool, including the wait for its workers
 
                         // Quantize intermediate ff_slice for each item
                         for (int idx = 0; idx < total_items; ++idx) {
                             strata::ds4::gguf::gg_cpu_quant(fmt.d_act, ppool->shared_ff[idx], ff_slice, ppool->shared_hq[idx]);
                         }
+                        if (ds) ds_hq = tpopt::now_ns();   // the intermediate slice, quantized for the down pass
 
                         // Launch Phase 2 (Parallel Down across all threads)
                         ppool->next_dn_task.store(0, std::memory_order_relaxed);
@@ -615,10 +632,15 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
                         while (ppool->p2_done.load(std::memory_order_acquire) < n_threads) {
                             tpopt::wait_for_progress(p2_barrier);
                         }
+                        if (ds) ds_dn = tpopt::now_ns();   // down across the pool, including the wait for its workers
                     }
                     std::atomic_thread_fence(std::memory_order_seq_cst);
                     *(volatile unsigned long long*) &hbox->done_seq = cur;
                     last_seq = cur;
+                    if (ds) {
+                        fnx::dec_stats_host(c, ds_q - ds_t0, ds_gu - ds_q, ds_hq - ds_gu, ds_dn - ds_hq, tpopt::now_ns() - ds_t0);
+                        if (c == 0) fnx::dec_stats_report_maybe();   // one reporter: the totals are shared by both cards
+                    }
                 }
             }).detach();
         }
@@ -787,6 +809,12 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
             throw std::runtime_error("FNX_RING_TAG_START: want 1.." + std::to_string(TAG_END - 1) + ", got " + std::to_string(v));
         tag_max_ = (unsigned) v;
     }
+    // M3-1: the tier is up (model.cpp's load called l2::setup), the prompt path has taken its slots (prefill_stages
+    // -> l2_pf::setup) and decode has taken its map (l2::dec::open above), so an arena expert is answered by the
+    // tier on both paths. This is the last point at which nothing is running: no window has been captured, no round
+    // is going, and the host worker only reads these mirrors when a request arrives. So the copies the arena made
+    // redundant can be given back here and nothing else has to know the order.
+    l2::drop_host(m_);
 }
 
 void Engine::clear_rings() {

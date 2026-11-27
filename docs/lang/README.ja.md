@@ -25,6 +25,31 @@
 
 **無料でオープンソース。自分の環境で動かせます。** デスクトップで、またはお好みのコーディングツールと一緒に Strata を使えます。アカウントは不要です。
 
+
+## この fork（Strata-tp）の本家との違い
+
+このツリーは [本家 Strata](https://github.com/Niko1221/Strata) の、手元の実機向け改造 fork です。追加した挙動は
+すべて既定 off のスイッチの後ろに置いたので、通常の利用では本家と同じ動作のままです。engine 側の差分・検証
+スクリプト・この記載は 1 行残らず AI が書いています（人が担当したのはコマンド実行と実測値の回収のみ）。
+
+**本家との主な違い**
+
+- **Turing（`sm_75`）2 枚の NVLink テンソル並列** - OCuLink（PCIe Gen3 x4）外付けの改造 RTX 2080 Ti 22GB x2 向けに、
+  NVLink P2P の direct exchange、RCCL、CPU Hybrid TP の待機を `futex park` へ切り替えています。
+- **別世代の 1 枚（RTX 5070 / `sm_120`）を L2 = エキスパート専用枠として追加** - Prefill は 5070 側の
+  `sm_120 HMMA.16816` ストリーミング GEMM と fp16 加算項で走り（10K 級 cold **1,418〜1,432 tok/s**、`tier compute`
+  約 1,912 → 279 ms）、Decode は router が 1 回で L1 / L2 / L3 へ排他分類して arena 分を 5070 が引き受けます。
+  短文の Prefill pass は常駐分だけを tier へ渡すので **5 tok fixed 509 ms → 300 ms** です。
+- **Host pinned RAM の二重保持を返す（`FNX_L2_DROP_HOST=1|2`）** - 5070 arena に載せた expert の RAM 側原本を、
+  1 層ずつ「生存者だけの pinned 確保 → 表の張り直し → 旧 block free」で返します（**5.14〜5.26 GiB 返却**、本番 8010 では
+  `shared` 25 → 20 GiB・`available` 10 → 20 GiB）。ストリーム下限に足りない端数 pass も、返した原本を読みに行く
+  代わりに tier へ回落します。これで 64 GB RAM の中に `MLOCK_MAX_GIB=10` が収まります。
+- **既定は何も動きません** - 追加したスイッチは既定 off（L2 枠が無い構成では export 自体しない）で、設定が要求しない
+  限り本家挙動・2 枚構成の数値のままです。
+
+スイッチ一覧と実測の経過は [`README_tp_opt.md`](../../README_tp_opt.md)（日本語）と
+[`README_tp_opt.en.md`](../../README_tp_opt.en.md)（英語）にあります。
+
 ## モデル
 
 まず **ISTA-DASLab** をおすすめします。次に **Unsloth** などの提供元です。メモリに収まる互換モデルがある場合に選べます。

@@ -25,6 +25,35 @@
 
 **Gratis, de código abierto y tuyo para ejecutar.** Usa Strata en tu escritorio o con tus herramientas de programación favoritas. No necesitas cuenta.
 
+
+## En qué se diferencia este fork del original
+
+Esta rama es un fork específico de hardware de [Strata](https://github.com/Niko1221/Strata). Cada
+comportamiento añadido queda detrás de un interruptor apagado por defecto, así que una instalación normal se
+comporta igual que el original. El diff del engine, los scripts de comprobación y estas notas los escribió la
+IA; la persona solo ejecutó los comandos y recogió las medidas.
+
+**Diferencias con el original**
+
+- **Paralelo de tensores Turing (`sm_75`) por NVLink** — para dos RTX 2080 Ti 22 GB modificadas colgadas de
+  OCuLink (PCIe Gen3 x4): intercambio directo P2P NVLink a medida, RCCL y una vía TP híbrida de CPU que espera en
+  `futex park` en vez de girar.
+- **Una GPU distinta y adicional como nivel L2 de expertos (RTX 5070 / `sm_120`)** — el Prefill se calcula en la
+  5070 con el GEMM streaming `sm_120 HMMA.16816` y sumandos fp16 (10K en frío **1.418-1.432 tok/s**, `tier
+  compute` de unos 1.912 → 279 ms); el Decode clasifica cada ronda MoE una vez en el router en L1 / L2 / L3 y la
+  mitad del arena la resuelve la 5070; una pasada Prefill corta solo entrega al nivel sus expertos residentes
+  (**5 tok fixed 509 ms → 300 ms**).
+- **La copia pinned del anfitrión del arena se devuelve (`FNX_L2_DROP_HOST=1|2`)** — los originales page-locked de
+  los expertos alojados en el arena se devuelven capa por capa tras la carga (**5,14-5,26 GiB**) y el pico sigue
+  plano; en el equipo de producción 8010 `shared` bajó de 25 a 20 GiB y `available` subió de 10 a 20 GiB. Una
+  pasada final demasiado corta para streamear cae de vuelta al nivel en vez de leer un original devuelto, y así
+  `MLOCK_MAX_GIB=10` cabe en 64 GB de RAM.
+- **Los valores por defecto no se mueven** — cada mando nuevo está apagado por defecto (y ni se exporta sin nivel
+  L2), de modo que el comportamiento del original y las cifras de la configuración de 2 tarjetas siguen iguales.
+
+Tabla de interruptores e historial de medidas: [`README_tp_opt.en.md`](../../README_tp_opt.en.md) (inglés),
+[`README_tp_opt.md`](../../README_tp_opt.md) (japonés).
+
 ## Modelos
 
 Recomendamos **primero ISTA-DASLab**, después **Unsloth** y otros proveedores, siempre que haya un modelo compatible que quepa en tu memoria.

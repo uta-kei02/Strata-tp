@@ -12,8 +12,8 @@ compute that runs on the 5070. The changes stay inside `engine/src/split/src/` a
 | Item | Value |
 |---|---|
 | Upstream base SHA | `3142b66b96e9c0e775e30f620b11b191a1427c2a` (main) |
-| Work branch | `tp-opt/strata-tp` (HEAD `4828e5725`) |
-| Push remote (origin) | https://github.com/uta-kei02/Strata-nvlink-tp.git |
+| Work branch | `feat/m3-1-l2-host-dedup` (rev.15-M3-1b) |
+| Push remote (origin) | https://github.com/uta-kei02/Strata-tp.git |
 | Upstream | push disabled (`git remote set-url --push upstream DISABLED`) |
 | Diff | `git diff --binary 3142b66b9` (same content as the bundled `patches/strata_tp_opt.patch`) |
 
@@ -30,12 +30,17 @@ compute that runs on the 5070. The changes stay inside `engine/src/split/src/` a
 | rev.15-M2b-1v | 988.1 tok/s (+18.7 %) | 54.62 tok/s | Chunk rows moved onto a 5070-only lane / a per-card addend event / the 2080 Ti and the 5070 run overlapped (pushed to origin) |
 | rev.15-M2b-1w | **1,099.4 tok/s (+11.3 %)** / 1,248.1 tok/s for a 4,096-row pass alone | 55.04 tok/s / 28.82 ms | Addends come back as f16 rows (Host relay 1,920 -> 960 MiB per card and pass) / card 0 marks its rows before the router / `FNX_PF_PASS` is passed through (`PASS=4` fell to 913.0 tok/s and Decode 51.11, so it is not the default) |
 | rev.15-M2b-2 | 1,099.4 tok/s (Prefill unchanged) | pending (was 55.04) | The Decode first tier is computed on the 5070 as well (one router pass distributes picks to L1 / L2 / L3 exclusively). Implemented and statically checked; the on-hardware bench is pending |
+| rev.15-M2b-2 (measured) | 895.1 tok/s (`FNX_L2_DEC=1`) | **55.46 tok/s / 28.42 ms** | 5 of 5 passes, no Xid, no ring error, 0 MiB copied in on every pass; the 5070 answered 82,252 of 82,432 requests (card 0 / card 1 symmetric), 0 retires |
+| rev.15-M2c-arch | **1,410.3 tok/s (+71 %)** | pending (was 55.46) | The MoE MMA picks its instruction width by device arch (the 5070 `sm_120` uses `HMMA.16816.F32`, the 2080 Ti keeps the old width): `tier compute` 1,912 -> 279 ms |
+| rev.15-M3-1a | - | - | Turing gets its tensor cores back too: the width choice in `moe_mma.cuh` now opens at `__CUDA_ARCH__ >= 750`, and `sm_75` builds the K=16 dot from two `mma.m16n8k8`. SASS check: `sm_75` shows `HMMA.1688.F32` 640 times and no `HMMA.884`, `sm_120` keeps `HMMA.16816.F32` 320 times |
+| rev.15-M3-1 (three measured runs) | 1,419.4 / 1,432.3 / 1,418.3 tok/s | 50.15 / 51.99 / **51.48 tok/s / 30.54 ms** | The page-locked Host originals of the experts resident in the 5070 arena are handed back one layer at a time (1,713 experts / 3.38 GiB, 2,622 / 5.26 GiB, 2,563 / 5.14 GiB). What is handed back only exists in the arena, so a short pass gives the tier only its resident experts (5 tok fixed 308.0 / 300.0 / 311.0 ms). Major faults 454.5 -> 344.0 per s. No Xid and no OOM in any run |
+| rev.15-M3-1b (production 8010) | - | short round trips ok | A tail pass shorter than `MAXT` = 16 rows now falls back onto the tier instead of reading a handed-back original. The repro passes at 2,089 tokens (41 left, 3.07 s) and 4,110 tokens (14 left, 6.96 s) with 0 `l2pf: off` lines and 0 `stage copy` errors. On 8010 the drop returned 2,620 experts / 5.25 GiB (10.35 s) alongside `MLOCK_MAX_GIB=10` |
 
-The next milestone is **1,500 tok/s** (7,609 tokens within 5.1 s; today it takes 6.9 s). On the Decode
-side the M2b-2 merge onto the 5070 is implemented and waits for its A / B bench
-(A = `FNX_L2_DEC=1`, B = `FNX_L2_DEC=0`). After that comes M3 (the 5070 as the entry-level primary
-cache, a 3-tier two-stage swap); the design and the reserved hooks are in `m2_design_rtx5070_l2.md`
-inside the bundled `docs/`.
+The fastest Prefill so far is M2c-arch at **1,410.3 tok/s**; the next **1,500 tok/s** (7,609 tokens
+within 5.1 s, today 6.9 s) lives on the first-tier swap and the K/V side, not on the 5070's instruction
+width. M3-1 is done up to handing the Host copies back; next is M3-2 (the 5070 arena as the entry-level
+primary cache, a 3-tier promotion path). The design and the reserved hooks are in
+`m2_design_rtx5070_l2.md` and `m3_plan.md` inside the bundled `docs/`.
 
 ## Switches read by the engine (default off)
 
@@ -55,6 +60,9 @@ inside the bundled `docs/`.
 | Decode also computed on the 5070 | `FNX_L2_DEC` | 1 (when L2 is on) / never exported with L2 off |
 | Decode L2 hit statistics, one line per 512 requests | `FNX_L2_DEC_STATS` | 0 |
 | Picks one window may send to the 5070 (retreat knob) | `FNX_L2_DEC_MAX` | 0 = no limit |
+| Decode split: L1/L2/L3 counts and the host worker / 5070 ms (3 lines a sample) | `FNX_DEC_STATS` | 0 (a branch only while off) |
+| Windows folded into one sample | `FNX_DEC_STATS_EVERY` | 2048 |
+| Hand back the Host copy of the experts resident in the 5070 arena after load (M3-1) | `FNX_L2_DROP_HOST` | 0 (1 arms only when the arena, `FNX_L2_PF`, `FNX_L2_DEC` and both cards' tables are all in place; otherwise it warns and stays off; 2 also hands back the resident experts that keep a first-tier swap slot) |
 | Chunked GDN (sub-chunk width auto-selected from the card's opt-in shared memory) | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1 (sm_75 = 16 columns = 57,988 B) / 0 |
 | GDN numeric compare / timing | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Diagnostics when Prefill fails | `FNX_PF_ERRDBG` | 0 |

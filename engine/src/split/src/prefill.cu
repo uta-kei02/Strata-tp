@@ -14,6 +14,7 @@
 #include "env.hpp"
 #include "pf_ring_plan.hpp"
 #include "l2_pf.hpp"   // rev.15-M2b-1: the routed experts on an opt-in third card
+#include "l2_offload.hpp"   // rev.15-M3-1: FNX_L2_DROP_HOST asks a short pass to run the arena's experts on the tier
 #include "../../tpopt/tp_opt.hpp"
 #if FNX_HIP
 #endif
@@ -1501,6 +1502,9 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     int pf_rows = 0;
     for (const PfChunk& ck : chunks) pf_rows = std::max(pf_rows, (int) ck.tokens.size());
     bool pf_tier = false;
+    struct L2PfPassGuard {
+        ~L2PfPassGuard() { l2::pf::end_pass(); }
+    } l2_pf_pass_guard;
     if (staging) {
     each([&](int, CardBuf& b, const CardW& w, Pf& p) {
         ckc(cudaMemcpyAsync(p.slot_h, w.ec.slot_of, (size_t) NL * NEXP * sizeof(int), cudaMemcpyDeviceToHost, b.st), "slots");
@@ -1508,8 +1512,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     });
     // one call for the whole pass, outside the per-card loop: the tier's table is the same for both cards
     pf_tier = l2::pf::use() && l2::pf::plan(m_, pf_rows, nk);
+    // rev.15-M3-1b: a staged pass can end in a tail shorter than the streaming bound (a 12 rows x 1 chunks pass of a
+    // long prompt), and plan() then hands it back to the cards - which no longer hold a copy of what the arena holds.
+    // Ask once more for the arena alone before anything decides where the bytes go: the tier keeps its residents, the
+    // cards keep their own, and the pass neither copies from a null nor faults on one.
+    if (!pf_tier && l2::ctx().dropped) pf_tier = l2::pf::use() && l2::pf::plan(m_, pf_rows, nk, /*stream=*/false);
     each([&](int, CardBuf& b, const CardW& w, Pf& p) {
             const ExpertCache& ec = w.ec;
+            static int no_host = 0;   // an entry nobody can read is named three times at most, never quietly
             p.staged = p.in_place = p.tier = 0;
             for (int l = 0; l < NL; ++l) {
                 const size_t gs = w.L[(size_t) l].gu_e_stride, ds = w.L[(size_t) l].down_e_stride;
@@ -1537,13 +1547,21 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                         // expert gets no job slot at all, so nothing reads this entry
                         p.ep_hgu[i] = w.ec_host_gu[i], p.ep_hdn[i] = w.ec_host_dn[i];
                         p.tier += gs + ds;
-                    } else if (k < fit) {
+                    } else if (k < fit && w.ec_host_gu[i] && w.ec_host_dn[i]) {
                         p.ep_hgu[i] = gu_at + (size_t) k * gs, p.ep_hdn[i] = dn_at + (size_t) k * ds;
                         add(w.ec_host_gu[i], gu_at + (size_t) k * gs, gs);
                         add(w.ec_host_dn[i], dn_at + (size_t) k * ds, ds);
                         ++k;
                         p.staged += gs + ds;
                     } else {
+                        // no byte is ever copied out of a copy that does not exist: cudaMemcpyAsync answers
+                        // "invalid argument" for a null source and the whole pass dies with it (this is exactly how the
+                        // 12-row tail of FNX_L2_DROP_HOST=2 ended). The entry falls back to where it was, and an entry
+                        // neither the host nor the tier can read is named instead of faulting later as an Xid 31.
+                        if ((!w.ec_host_gu[i] || !w.ec_host_dn[i]) && no_host < 3) {
+                            ++no_host;
+                            std::fprintf(stderr, "fnx: l2pf: off: layer %d expert %d has no host copy and no tier for this pass\n", l, e);
+                        }
                         p.ep_hgu[i] = w.ec_host_gu[i], p.ep_hdn[i] = w.ec_host_dn[i];
                         p.in_place += gs + ds;
                     }
@@ -1552,6 +1570,24 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             ckc(cudaMemcpyAsync(p.ep_gu, p.ep_hgu, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice, b.st), "tables");
             ckc(cudaMemcpyAsync(p.ep_dn, p.ep_hdn, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice, b.st), "tables");
         });
+    }
+    else if (l2::ctx().dropped) {
+    // rev.15-M3-1 (FNX_L2_DROP_HOST): a pass that does not stage - 1..FNX_PF_STAGE_ROWS-1 tokens, the 1,100-row
+    // warm-up, a 64-token prompt, a 4-row tail - used to read every expert from its page-locked copy in place. For
+    // the arena's experts that copy is gone, so the tier takes exactly those: stream=false means no slot is sized,
+    // no byte is copied up, and the cards keep (and read) every expert the arena does not hold. The run table below
+    // then masks the arena's experts out of both cards' jobs, so a Turing kernel never sees the null left in ep.
+    pf_tier = l2::pf::use() && l2::pf::plan(m_, pf_rows, nk, /*stream=*/false);
+    }
+    if (l2::ctx().dropped && !pf_tier) {
+        // With the copies handed back there is nothing for a card to read for these experts: it would fault on the
+        // null (Xid 31), so a pass the tier will not take is named rather than quietly computed wrong.
+        static int told = 0;
+        if (told < 3) {
+            ++told;
+            std::fprintf(stderr, "fnx: l2pf: off: a %d rows x %d chunks pass has no tier after FNX_L2_DROP_HOST:"
+                                 " the cards no longer hold a host copy of the arena's experts\n", pf_rows, nk);
+        }
     }
     // layer l's experts into stage[l & 1] once the layer two before is done with it
     auto stage_in = [&](int l) {
@@ -1795,7 +1831,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 cudaStream_t s = b.st;
                 const int P = C * TOPK, ffs = w.ff1 - w.ff0;
                 const int pf_k = l * nk + j;
-                if (c == 0) l2::pf::wait_xread(pf_k, s);   // the tier may still be reading the rows it copied last step
+                if (pf_tier && c == 0) l2::pf::wait_xread(pf_k, s);   // the tier may still be reading the rows it copied last step
                 DW gu_e = L.gu_e, down_e = L.down_e;
                 if (staging) {
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
@@ -1808,10 +1844,10 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 // after the top-k lets 21 MiB cross while card 0 runs the router, the top-k, the count and its job
                 // tables - the copy reads only what the hc read above wrote (xh), so it is ready by now.
                 // FNX_L2_PF_EARLY_IN=0 marks nothing here; both marks then go at record_pairs, just after the top-k
-                if (c == 0) l2::pf::record_rows(pf_k, s);
+                if (pf_tier && c == 0) l2::pf::record_rows(pf_k, s);
                 pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
                 k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
-                if (c == 0) l2::pf::record_pairs(pf_k, s);   // the tier masks its own weights from these numbers
+                if (pf_tier && c == 0) l2::pf::record_pairs(pf_k, s);   // the tier masks its own weights from these numbers
                 ckc(cudaMemsetAsync(p.cnt, 0, NEXP * 4, s), "cnt");
                 k_pf_count<<<(P + 255) / 256, 256, 0, s>>>(p.topi, P, p.cnt);
                 if (b.route_cnt) route_count(p.topi, P, b.route_cnt + (size_t) (NL + l) * NEXP, s);
@@ -1842,14 +1878,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 m.part = p.part;
                 m.topw = pf_run ? p.topwm : p.topw;
                 m.logits = p.logits;
-                l2::pf::set_add(m, l2::pf::collect(c, l, l * nk + j, C, b.st));   // null unless this layer went to the tier
+                if (pf_tier) l2::pf::set_add(m, l2::pf::collect(c, l, l * nk + j, C, b.st));   // null unless this layer went to the tier
                 if (p.ring_sm) ring_sum(p.ring, p.bo_f, C, (const unsigned*) (p.ctl + 1), 2 * l + 1, b.st, m);
                 else if (p.overlap) ring_async(c, b, p, p.bo_f, &m, j, p.ev_rf[j], C, hs && l >= PLE_LAYER);
                 else pf_ring(p, c, p.bo_f, C, &m, b.ring.err, b.st);
                 // the sum that just got enqueued on this card's stream is what reads the tier's rows (kernels.cu:876,
                 // and k_pfr_addend above them), so say so now and let the tier's lane land the next addend in this
                 // landing slot meanwhile; nothing else in the pass frees it (l2_pf.hpp's read_done)
-                if (m.add || m.add_h) l2::pf::read_done(c, l * nk + j, b.st);
+                if (pf_tier && (m.add || m.add_h)) l2::pf::read_done(c, l * nk + j, b.st);
             });
         }
     }
@@ -1899,7 +1935,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     // FNX_L2_PF_TIMING: the tier's own line for this pass, once every card's stream is over (which is after every
     // addend, and so after every tier launch). Prints nothing at all unless the knob asked, and comes before the ring
     // error so a pass that failed still says where its time went.
-    l2::pf::timing_report();
+    if (pf_tier) l2::pf::timing_report();
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
     if (mtp_ && draft8)
