@@ -755,7 +755,12 @@ bool plan(Model& m, int rows, int nk, bool stream) {
     // stream=false is the resident-only ask (M3-1): the tier takes what its arena holds and nothing else, so a short
     // prompt can run with the RAM copies given back. The slots keep whatever the last pass sized them to; nothing
     // streams into them this time, so a stale size cannot move a byte.
-    const bool do_stream = stream && s.stream;
+    bool do_stream = stream && s.stream;
+    // rev.15-M3-1b: with the RAM copies handed back the cards cannot read the arena's experts at all, so a pass that
+    // is too short to stream - the 12-row tail of a long prompt, staged like the rest of it - still has to hand them
+    // over. The rows bound below then gives up streaming, never the tier: resident-only only needs rows >= 1. Only the
+    // dropped case changes, so a pass asked for while the copies are still in place is bit for bit what it was.
+    if (do_stream && rows < MAXT && l2::ctx().dropped) do_stream = false;
     s.pass = false;
     s.filled_to = -1;   // a new pass fills its slots from the first layer again
     for (int q = 0; q < XRING_MAX; ++q) s.prev_read[q] = -1;   // ... and every rows slot starts unread
