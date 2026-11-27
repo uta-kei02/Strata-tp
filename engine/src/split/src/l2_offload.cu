@@ -389,7 +389,13 @@ void drop_host(Model& m)
     const size_t nidx = (size_t) NL * NEXP;
 
     const char* why = nullptr;
-    if (!c.ok || !c.arena || c.experts <= 0 || c.at.size() != nidx) why = "the tier's arena is not what this expects";
+    char detail[192] = {};
+    if (!c.ok || !c.arena || c.experts <= 0 || c.at.size() != nidx) {
+        std::snprintf(detail, sizeof(detail),
+                      "the tier's arena is not what this expects (ok %d, arena %s, experts %d, at %zu entries of %zu)",
+                      (int) c.ok, c.arena ? "set" : "null", c.experts, c.at.size(), nidx);
+        why = detail;
+    }
     else if (m.arena) why = "FNX_ARENA lends these very slots to K/V";
     else if (!pf::use()) why = "the prompt path is not on the tier (FNX_L2_PF=0)";
     else if (!dec::map(0) || !dec::map(1)) why = "decode is not on the tier (FNX_CPU_MOE=0 / FNX_L2_DEC=0)";
@@ -398,9 +404,27 @@ void drop_host(Model& m)
         if (dcap != 0 && dcap < MAXT * TOPK) why = "FNX_L2_DEC_MAX caps the tier below a whole window";
         for (int card = 0; card < NCARD && !why; ++card) {
             const CardW& cw = m.cards[card];
-            if (cw.ec_owner0.size() != nidx || cw.ec_slot0.size() != nidx || cw.cpu_host_gu.size() != nidx ||
-                cw.cpu_host_dn.size() != nidx || !cw.ec.ep_gu || !cw.ec.ep_dn || !cw.ec.host_gu || !cw.ec.host_dn)
-                why = "a card's expert tables are not the whole grid this expects";
+            // two widths here, and mixing them up turns the gate off for every run: ec_owner0 is one entry per VRAM
+            // slot (model.cpp:372 sets n_slots to owner.size(), :399 hands that vector over), while the tables this
+            // function walks are one entry per expert. Say which array fell short, and with how many rows.
+            const char* bad = nullptr;
+            long long have = 0, want = (long long) nidx;
+            if (cw.ec.n_slots <= 0) { bad = "ec.n_slots"; have = cw.ec.n_slots; want = 1; }
+            else if (cw.ec_owner0.size() != (size_t) cw.ec.n_slots) {
+                bad = "ec_owner0"; have = (long long) cw.ec_owner0.size(); want = cw.ec.n_slots;
+            } else if (cw.ec_slot0.size() != nidx) { bad = "ec_slot0"; have = (long long) cw.ec_slot0.size(); }
+            else if (cw.ec_host_gu.size() != nidx) { bad = "ec_host_gu"; have = (long long) cw.ec_host_gu.size(); }
+            else if (cw.ec_host_dn.size() != nidx) { bad = "ec_host_dn"; have = (long long) cw.ec_host_dn.size(); }
+            else if (cw.cpu_host_gu.size() != nidx) { bad = "cpu_host_gu"; have = (long long) cw.cpu_host_gu.size(); }
+            else if (cw.cpu_host_dn.size() != nidx) { bad = "cpu_host_dn"; have = (long long) cw.cpu_host_dn.size(); }
+            else if (!cw.ec.ep_gu || !cw.ec.ep_dn || !cw.ec.host_gu || !cw.ec.host_dn) {
+                bad = "ec.ep_gu / ep_dn / host_gu / host_dn"; have = 0;
+            }
+            if (bad) {
+                std::snprintf(detail, sizeof(detail), "card %d reads %s with %lld rows where this expects %lld",
+                              card, bad, have, want);
+                why = detail;
+            }
         }
     }
     if (why) {
