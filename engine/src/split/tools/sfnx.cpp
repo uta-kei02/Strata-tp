@@ -568,6 +568,9 @@ struct Server {
         const std::vector<unsigned> v = e.route_counts();
         if (v.empty()) return;
         const char* path = std::getenv("FNX_ROUTE_FILE");
+        // FNX_L2_DYN turns the same tallies on for its dry-run (engine.cu:280) without naming a file. Reading them is
+        // the measurement; there is nothing to write until somebody names one, and std::string(nullptr) is no answer.
+        if (!path) return;
         const std::string tmp = std::string(path) + ".tmp";
         if (!write_u32s(tmp.c_str(), "wb", v) || std::rename(tmp.c_str(), path) != 0) {
             std::fprintf(stderr, "sfnx: FNX_ROUTE_FILE: cannot write %s (%s): route counting stopped\n", path, std::strerror(errno));

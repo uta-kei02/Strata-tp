@@ -63,6 +63,8 @@ primary cache, a 3-tier promotion path). The design and the reserved hooks are i
 | Decode split: L1/L2/L3 counts and the host worker / 5070 ms (3 lines a sample) | `FNX_DEC_STATS` | 0 (a branch only while off) |
 | Windows folded into one sample | `FNX_DEC_STATS_EVERY` | 2048 |
 | Hand back the Host copy of the experts resident in the 5070 arena after load (M3-1) | `FNX_L2_DROP_HOST` | 0 (1 arms only when the arena, `FNX_L2_PF`, `FNX_L2_DEC` and both cards' tables are all in place; otherwise it warns and stays off; 2 also hands back the resident experts that keep a first-tier swap slot) |
+| Pre-study for moving the 5070 arena around (host-pinned probe + a dry-run over the route counts, M3-2 Step 0) | `FNX_L2_DYN` | 0 (a branch only while off; 1 runs probes and a dry run that move no weights, tables or maps) |
+| How many swaps the dry run should price | `FNX_L2_DYN_N` | 0 = price up to the resident count |
 | Chunked GDN (sub-chunk width auto-selected from the card's opt-in shared memory) | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1 (sm_75 = 16 columns = 57,988 B) / 0 |
 | GDN numeric compare / timing | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Diagnostics when Prefill fails | `FNX_PF_ERRDBG` | 0 |

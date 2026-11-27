@@ -13,6 +13,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -25,6 +27,8 @@ constexpr double GIB = 1024.0 * 1024.0 * 1024.0;
 constexpr size_t MIB = 1u << 20;
 constexpr size_t PROBE_PAGE_BYTES = 64 * MIB;    // the pageable compare, so the pinned number can be read against it
 constexpr size_t PROBE_D2H_BYTES = 256 * MIB;    // arena -> pinned host
+constexpr size_t PROBE_XDEV_BYTES = 32 * MIB;    // FNX_L2_DYN: one cross-context read and one write of a RAM copy
+constexpr size_t PROBE_RAW_BYTES = 64 * 1024;    // the same block by its raw host address, with no mapped name
 
 // one card's slice of one expert, straight out of its page-locked copy. The host side of an expert is one contiguous
 // [gate|up | down] block (model.cpp:971-974 writes it that way), so this is normally one DMA per card per expert.
@@ -107,6 +111,23 @@ void host_fold(const std::vector<Piece>& pieces, unsigned long long& sum, unsign
         xr ^= px[(size_t) t];
     }
 }
+
+// The tier's context for the length of one block. l2_dec.cu has its own guard for the same job; this file's probes
+// run inside setup and drop_host, which already switch devices themselves, so it keeps a separate one. The device
+// only goes back when the switch worked, so a failed switch cannot leave the caller standing on the wrong card.
+struct OnDevice {
+    int prev = 0;
+    bool ok = false;
+    explicit OnDevice(int d) {
+        if (cudaGetDevice(&prev) != cudaSuccess) prev = d;
+        ok = cudaSetDevice(d) == cudaSuccess;
+    }
+    ~OnDevice() {
+        if (ok) cudaSetDevice(prev);
+    }
+    OnDevice(const OnDevice&) = delete;
+    OnDevice& operator=(const OnDevice&) = delete;
+};
 
 }  // namespace
 
@@ -215,6 +236,19 @@ void setup(Model& m) {
         return a.first > b.first;
     });
     if (hot.empty()) return off("no expert of this model is in host RAM (nothing to place)");
+
+    // What one expert of this layer costs, all cards' slices together: the same sum the fill below walks, saved for
+    // the dry-run of FNX_L2_DYN (docs/m3_plan.md sec.9.5), which has to size a re-lay without the arena in the way.
+    c.expert_bytes.assign((size_t) NL, 0);
+    for (int l = 0; l < NL; ++l) {
+        size_t need = 0;
+        for (int t = 0; t < NCARD; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            const int p = cw.ec.pool_of[l];
+            if (p >= 0 && p < EC_POOLS) need += cw.ec.slot_bytes[p];
+        }
+        c.expert_bytes[(size_t) l] = need;
+    }
 
     // M2b-1's streamed slots are reserved here, before the arena asks for a byte: arena + slots x2 share one envelope,
     // and the envelope is `budget` - the number expert_budget_gib() already holds FNX_L2_RESERVE_GIB back of, so the
@@ -654,6 +688,19 @@ void drop_host(Model& m)
     c.dropped = gone > 0 && cards == NCARD;
     c.freed = freed;
     c.dropped_experts = gone;
+    // Which layers now live in a block this function laid down (Mapped | Portable) and which still live in
+    // model.cpp's original (Mapped alone): FNX_L2_DYN's probe samples one block of each kind that is really alive
+    // (docs/m3_plan.md sec.9.5). A layer with nothing to give back keeps its original, so its entry stays null; a
+    // gate that turned the drop off leaves both vectors empty, which is how the probe tells "no such block" apart
+    // from "measured and failed".
+    c.new_host.assign((size_t) NCARD * NL, nullptr);
+    c.new_host_bytes.assign((size_t) NCARD * NL, 0);
+    for (int card = 0; card < NCARD; ++card)
+        for (int l = 0; l < NL; ++l) {
+            const size_t k = (size_t) card * NL + (size_t) l;
+            c.new_host[k] = cd[card].new_h[(size_t) l];
+            if (c.new_host[k]) c.new_host_bytes[k] = cd[card].keep[(size_t) l] * cd[card].exp_b[(size_t) l];
+        }
     std::fprintf(stderr,
                  "fnx: l2: drop: %d experts gave their RAM copies back: %.2f GiB off the host (%d of %d cards, %.2f s), "
                  "%d of them still with a first-tier slot: the arena is where their weights live now\n",
@@ -661,6 +708,313 @@ void drop_host(Model& m)
     for (int card = 0; card < NCARD; ++card)
         std::fprintf(stderr, "fnx: l2: drop: card %d %s: %.2f GiB back, %.2f GiB of copies left\n", card,
                      cd[card].wrote ? "gave" : "kept", (double) cd[card].freed / GIB, (double) m.cards[card].host_bytes / GIB);
+}
+
+// FNX_L2_DYN's first question, and the one reading the code cannot settle: a re-lay would read expert weights out of
+// page-locked RAM that a card's own context reserved, and only one of the two kinds of block was asked to be
+// portable. model.cpp:947 reserves the cards' host copies with cudaHostAllocMapped alone; the smaller block
+// drop_host lays down (l2_offload.cu:556) adds cudaHostAllocPortable. So ask the tier's own context to name one live
+// block of each kind, read out of it and write into it, and print what came back. The read only reads a live block
+// and the write only lands in scratch of the tier's own, so no weight, no entry of at[], no card expert table and no
+// tier map moves: the run that measures answers exactly what it answers with the knob off. sec.9.5 of
+// docs/m3_plan.md, and the answer decides whether a re-lay must copy through a block it laid down itself.
+void probe_pinned(Model& m, int kind)
+{
+    Ctx& c = shared();
+    if (dyn_mode() < 1) return;   // off: no CUDA call, no table read, no word printed
+    Ctx::Probe& pr = kind ? c.probe_portable : c.probe_mapped;
+    pr.ran = true;
+    const char* which = kind ? "portable" : "mapped";
+    const unsigned flags = kind ? (unsigned) (cudaHostAllocMapped | cudaHostAllocPortable) : (unsigned) cudaHostAllocMapped;
+    if (!c.ok || !c.arena) {
+        std::fprintf(stderr, "fnx: l2: dyn: probe %s: off: the tier is off, so there is no context to ask\n", which);
+        return;
+    }
+    const size_t nidx = (size_t) NL * NEXP;
+
+    // one live block of this kind, found in the tables the cards are reading now. A layer keeps model.cpp's original
+    // only when drop_host had nothing to shrink there; a layer it did shrink gave the original back at :619, so the
+    // new_host record is the whole of what is alive. Inside either block the rows run from its first byte in expert
+    // order, which is the same assumption drop_host's own first round makes (l2_offload.cu:515-522).
+    int fcard = -1, flayer = -1;
+    char* base = nullptr;
+    size_t bytes = 0;
+    for (int card = 0; card < NCARD && !base; ++card) {
+        const CardW& cw = m.cards[(size_t) card];
+        for (int l = 0; l < NL && !base; ++l) {
+            const size_t k = (size_t) card * NL + (size_t) l;
+            const bool was_relaid = k < c.new_host.size() && c.new_host[k] != nullptr;
+            if ((kind != 0) != was_relaid) continue;
+            const size_t gs = cw.L[(size_t) l].gu_e_stride, ds = cw.L[(size_t) l].down_e_stride;
+            if (!gs || !ds) continue;
+            char* first = nullptr;
+            size_t rows = 0;
+            for (int e = 0; e < NEXP; ++e) {
+                const size_t i = (size_t) l * NEXP + (size_t) e;
+                if (i >= nidx || i >= cw.cpu_host_gu.size() || !cw.cpu_host_gu[i]) continue;
+                if (!first) first = (char*) cw.cpu_host_gu[i];
+                ++rows;
+            }
+            if (!first || !rows) continue;
+            base = was_relaid ? c.new_host[k] : first;
+            bytes = rows * (gs + ds);
+            if (was_relaid && k < c.new_host_bytes.size() && c.new_host_bytes[k] && c.new_host_bytes[k] < bytes)
+                bytes = c.new_host_bytes[k];
+            fcard = card;
+            flayer = l;
+        }
+    }
+    pr.found = base != nullptr;
+    pr.card = fcard;
+    if (!base) {
+        std::fprintf(stderr, "fnx: l2: dyn: probe %s: nothing to sample: %s\n", which,
+                     kind ? "no layer of either card was re-laid, so no block of these flags exists (measure it with "
+                            "FNX_L2_DROP_HOST on)"
+                          : "every layer of both cards was re-laid, so no original of these flags is left (measure it "
+                            "with FNX_L2_DROP_HOST=0)");
+        return;
+    }
+
+    size_t want = bytes < PROBE_XDEV_BYTES ? bytes : PROBE_XDEV_BYTES;
+    std::string bad;
+    // a twin of the block, reserved by the card that owns the original and with the flags of the kind being asked
+    // about: that is the shape the write-back of a re-lay arrives in, so writing into it measures the same thing
+    char* twin = nullptr;
+    {
+        OnDevice on_card(m.cards[(size_t) fcard].dev);
+        if (!on_card.ok) bad = "cudaSetDevice(" + std::to_string(m.cards[(size_t) fcard].dev) + ") failed";
+        else if (cudaHostAlloc((void**) &twin, want, flags) != cudaSuccess) {
+            twin = nullptr;
+            bad = "card " + std::to_string(m.cards[(size_t) fcard].dev) + " could not reserve a page-locked twin of these flags";
+        }
+    }
+    pr.bytes = want;
+    char* scratch = nullptr;
+    bool ours = false;
+    {
+        OnDevice on_tier(c.dev);
+        if (!on_tier.ok) bad = "cudaSetDevice(" + std::to_string(c.dev) + ") failed";
+        else {
+            void* dp = nullptr;
+            pr.map_ok = cudaHostGetDevicePointer(&dp, (void*) base, 0) == cudaSuccess;
+            // the arena's untouched tail is already paid for and nobody reads it (it is the room M3's demotion would
+            // overwrite); a card whose arena came out full gets a buffer of its own instead, smaller if need be
+            if (c.demote_room >= want) scratch = c.arena + c.moved;
+            else
+                for (size_t sz = want; sz >= MIB && !scratch; sz /= 2) {
+                    if (cudaMalloc((void**) &scratch, sz) == cudaSuccess) {
+                        ours = true;
+                        want = sz < want ? sz : want;
+                        pr.bytes = want;
+                    } else
+                        scratch = nullptr;
+                }
+            if (!scratch) bad = "the tier has nothing to read into (neither its arena tail nor a cudaMalloc of 1 MiB)";
+            else {
+                const size_t raw_n = want < PROBE_RAW_BYTES ? want : PROBE_RAW_BYTES;
+                pr.raw_ok = cudaMemcpy(scratch, (const void*) base, raw_n, cudaMemcpyHostToDevice) == cudaSuccess;
+                (void) cudaGetLastError();   // an unmapped raw address is this probe's answer, not the run's error
+                if (pr.map_ok) {
+                    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+                    if (cudaMemcpy(scratch, (const char*) dp, want, cudaMemcpyHostToDevice) == cudaSuccess) {
+                        pr.h2d_ok = true;
+                        const double s = seconds_since(t0);
+                        pr.h2d_gbs = s > 0 ? (double) want / s / 1e9 : 0;
+                    } else
+                        bad = std::string("the tier could not read the block: ") + cudaGetErrorString(cudaGetLastError());
+                } else
+                    bad = "cudaHostGetDevicePointer named nothing for this block";
+                if (twin) {
+                    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+                    if (cudaMemcpy(twin, c.arena, want, cudaMemcpyDeviceToHost) == cudaSuccess) {
+                        pr.d2h_ok = true;
+                        const double s = seconds_since(t1);
+                        pr.d2h_gbs = s > 0 ? (double) want / s / 1e9 : 0;
+                    } else {
+                        const std::string w = std::string("the tier could not write the twin: ") + cudaGetErrorString(cudaGetLastError());
+                        bad = bad.empty() ? w : bad + ", " + w;
+                    }
+                }
+            }
+            if (ours) cudaFree(scratch);
+        }
+    }
+    if (twin) {
+        OnDevice on_card(m.cards[(size_t) fcard].dev);
+        cudaFreeHost(twin);
+    }
+    const std::string tail = bad.empty() ? std::string() : (", " + bad);
+    std::fprintf(stderr,
+                 "fnx: l2: dyn: probe %s: card %d layer %d: %zu B of a %zu B block: the tier's name for it %s, reads "
+                 "%.2f GB/s, writes %.2f GB/s, the raw host address %s%s\n",
+                 which, fcard, flayer, pr.bytes, bytes, pr.map_ok ? "ok" : "no", pr.h2d_gbs, pr.d2h_gbs,
+                 pr.raw_ok ? "reads too" : "does not read", tail.c_str());
+}
+
+// FNX_L2_DYN's other half, and the number that decides whether M3-2 is worth building at all: ask the picks of the
+// passes so far the question a re-lay would ask, and print what it would have covered. The tally is card 0's
+// [decode | prompt][NL][NEXP] counters (engine.cu:278-281), which grows over the life of the run and is never
+// reset, so what a re-lay would chase is the heat since the last look. Nothing here asks the GPU anything: it reads
+// at[] and the cards' host mirrors only, and moves no weight, no entry of at[], no expert table and no tier map, so
+// the run answers exactly as it answers with the knob off. docs/m3_plan.md sec.9.6.
+void note_route_counts(Model& m, const unsigned* counts, size_t n)
+{
+    Ctx& c = shared();
+    if (dyn_mode() < 1) return;   // off: not one table read, not one word printed
+    const size_t nidx = (size_t) NL * NEXP;
+    if (!c.ok || !c.arena || c.at.size() != nidx) return;
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    static bool shape_said = false;                 // a tally that was never turned on is said once, not per reply
+    static std::vector<unsigned long long> last;    // the tally as of the previous look
+    if (!counts || n != 2 * nidx) {
+        if (!shape_said) {
+            shape_said = true;
+            std::fprintf(stderr, "fnx: l2: dyn: counts: want %zu counters, got %zu: FNX_ROUTE_COUNT=1 is what turns them on\n",
+                         (size_t) (2 * nidx), n);
+        }
+        return;
+    }
+
+    std::vector<unsigned long long> cum(nidx, 0), heat(nidx, 0);
+    unsigned long long total = 0, since = 0;
+    for (size_t i = 0; i < nidx; ++i) {
+        cum[i] = (unsigned long long) counts[i] + (unsigned long long) counts[nidx + i];
+        total += cum[i];
+    }
+    const bool had = last.size() == nidx;
+    for (size_t i = 0; i < nidx; ++i) {
+        heat[i] = had && cum[i] >= last[i] ? cum[i] - last[i] : cum[i];
+        since += heat[i];
+    }
+    last = cum;
+    if (!since) return;   // nothing was routed since the last look
+
+    // who the arena already covers, and what one re-lay could reach. An expert outside the arena counts only while
+    // every card still holds its page-locked copy: one with none lives in a card's VRAM for good (an immortal
+    // first-tier slot), so it was never this tier's to take in the first place.
+    std::vector<int> inside, outside;
+    size_t resident = 0, no_ram = 0;
+    unsigned long long covered = 0;
+    for (size_t i = 0; i < nidx; ++i) {
+        if (c.at[i] >= 0) {
+            ++resident;
+            covered += heat[i];
+            inside.push_back((int) i);
+            continue;
+        }
+        bool ram = true;
+        for (int t = 0; t < NCARD; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            if (i >= cw.cpu_host_gu.size() || i >= cw.cpu_host_dn.size() || !cw.cpu_host_gu[i] || !cw.cpu_host_dn[i]) {
+                ram = false;
+                break;
+            }
+        }
+        if (!ram) {
+            if (heat[i]) ++no_ram;
+            continue;
+        }
+        if (heat[i]) outside.push_back((int) i);
+    }
+
+    // A newcomer takes the victim's arena row and the victim takes the newcomer's RAM rows, so one 1-for-1 swap needs
+    // the two layers described alike on every card: the pool's row layout (dn_off, slot_bytes) and the host row
+    // (gate|up and down strides). Those four numbers per card are the key; docs/m3_plan.md sec.9.8.
+    const auto shape_of = [&](int l) {
+        std::vector<unsigned long long> k;
+        if (l < 0 || l >= NL) return k;
+        k.reserve((size_t) NCARD * 4);
+        for (int t = 0; t < NCARD; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            const int p = cw.ec.pool_of[l];
+            if (p < 0 || p >= EC_POOLS) {
+                k.clear();
+                return k;
+            }
+            k.push_back((unsigned long long) cw.ec.dn_off[p]);
+            k.push_back((unsigned long long) cw.ec.slot_bytes[p]);
+            k.push_back((unsigned long long) cw.L[(size_t) l].gu_e_stride);
+            k.push_back((unsigned long long) cw.L[(size_t) l].down_e_stride);
+        }
+        return k;
+    };
+    std::map<std::vector<unsigned long long>, std::vector<int>> cold;   // this shape's residents, coldest first
+    for (int i : inside) cold[shape_of(i / NEXP)].push_back(i);
+    for (auto& kv : cold)
+        std::stable_sort(kv.second.begin(), kv.second.end(), [&](int a, int b) { return heat[a] < heat[b]; });
+    std::map<std::vector<unsigned long long>, size_t> used;   // how many of this shape's coldest are already matched
+
+    std::stable_sort(outside.begin(), outside.end(), [&](int a, int b) { return heat[a] > heat[b]; });
+    size_t ask = dyn_swap_n() > 0 ? (size_t) dyn_swap_n() : resident;
+    if (ask > resident) ask = resident;
+    if (ask > outside.size()) ask = outside.size();
+    size_t pairs = 0, no_shape = 0, copy_bytes = 0, slot_victims = 0;
+    unsigned long long moved = 0;
+    std::vector<std::pair<int, int>> shown;   // the first few newcomer -> victim pairs, for the log
+    for (int ni : outside) {
+        if (pairs >= ask) break;
+        const std::vector<unsigned long long> k = shape_of(ni / NEXP);
+        if (k.empty()) { ++no_shape; continue; }
+        const auto it = cold.find(k);
+        if (it == cold.end()) { ++no_shape; continue; }
+        size_t& u = used[k];
+        if (u >= it->second.size()) { ++no_shape; continue; }
+        const int vi = it->second[u];
+        ++u;
+        ++pairs;
+        moved += heat[ni];
+        const int lv = ni / NEXP;
+        if (lv >= 0 && (size_t) lv < c.expert_bytes.size()) copy_bytes += c.expert_bytes[(size_t) lv];
+        // a victim that still holds one of the card's VRAM slots loses nothing but its RAM mirror: its weights stay
+        // in the slot, so only host entries come back (sec.9.9). The host side of the cards' slot table is the
+        // snapshot taken at load, so say as much rather than claim it is the live one.
+        bool holds = true;
+        for (int t = 0; t < NCARD; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            if ((size_t) vi >= cw.ec_slot0.size() || cw.ec_slot0[(size_t) vi] < 0) { holds = false; break; }
+        }
+        if (holds) ++slot_victims;
+        if (shown.size() < 5) shown.push_back({ni, vi});
+    }
+
+    // how long one such re-lay would take: the newcomers' bytes in over PCIe, the victims' bytes back into RAM. The
+    // fill of setup() already timed the first direction against the same page-locked blocks; the probe's write-back
+    // number, when the knob ran it, is the second.
+    const double gbs_in = c.h2d_pinned_gbs > 0 ? c.h2d_pinned_gbs : c.probe_mapped.h2d_gbs;
+    const double gbs_back = c.probe_mapped.d2h_gbs > 0 ? c.probe_mapped.d2h_gbs : c.d2h_gbs;
+    std::string when;
+    if (gbs_in > 0 || gbs_back > 0) {
+        char num[96];
+        const double secs = (gbs_in > 0 ? (double) copy_bytes / gbs_in / 1e9 : 0) +
+                            (gbs_back > 0 ? (double) copy_bytes / gbs_back / 1e9 : 0);
+        std::snprintf(num, sizeof num, ", %.2f s of copy at %.2f GB/s in and %.2f GB/s back", secs, gbs_in, gbs_back);
+        when = num;
+    } else
+        when = ", no copy speed measured to price it with";
+
+    std::fprintf(stderr,
+                 "fnx: l2: dyn: counts: %llu picks since the last look, %llu in all; %llu of them an expert the arena "
+                 "holds (%.1f%%); %zu experts resident, %zu outside with a RAM copy, %zu outside with none (a "
+                 "first-tier slot for good)\n",
+                 since, total, covered, 100.0 * (double) covered / (double) since, resident, outside.size(), no_ram);
+    std::fprintf(stderr,
+                 "fnx: l2: dyn: dry-run: the hottest %zu outside for the coldest %zu inside would have covered %llu "
+                 "more picks (%.1f%% -> %.1f%%); %zu found no partner of their shape, %zu victims still hold a "
+                 "first-tier slot (as the cards' table read it at load)%s\n",
+                 ask, pairs, moved, 100.0 * (double) covered / (double) since,
+                 100.0 * (double) (covered + moved) / (double) since, no_shape, slot_victims, when.c_str());
+    if (!shown.empty()) {
+        std::string line;
+        for (size_t k = 0; k < shown.size(); ++k) {
+            char buf[96];
+            std::snprintf(buf, sizeof buf, "%sl%d/e%d %llu -> victim l%d/e%d", k ? "; " : "", shown[k].first / NEXP,
+                          shown[k].first % NEXP, heat[(size_t) shown[k].first], shown[k].second / NEXP,
+                          shown[k].second % NEXP);
+            line += buf;
+        }
+        std::fprintf(stderr, "fnx: l2: dyn: dry-run: first picks: %s\n", line.c_str());
+    }
 }
 
 }  // namespace l2

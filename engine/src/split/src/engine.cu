@@ -275,7 +275,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
             b->probe_guess = dalloc<int>((size_t) NL * MAXT * TOPK);
             b->probe_cnt = dalloc<unsigned long long>(7);
         }
-        if (c == 0 && env_flag("FNX_ROUTE_COUNT")) {
+        // FNX_L2_DYN reads the same tally for its dry-run (l2_offload.cu's note_route_counts), so asking for the
+        // dynamic tier turns the counters on by itself; with the knob off this is exactly the old condition.
+        if (c == 0 && (env_flag("FNX_ROUTE_COUNT") || l2::dyn_mode() >= 1)) {
             b->route_cnt = dalloc<unsigned>((size_t) 2 * NL * NEXP);
             ck(cudaMemset(b->route_cnt, 0, (size_t) 2 * NL * NEXP * sizeof(unsigned)), "route counts");
         }
@@ -815,6 +817,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
     // is going, and the host worker only reads these mirrors when a request arrives. So the copies the arena made
     // redundant can be given back here and nothing else has to know the order.
     l2::drop_host(m_);
+    // M3-2 step 0 (docs/m3_plan.md sec.9.5): the same last quiet point, asked one question the code cannot answer by
+    // reading it - can this context reach, read and write each of the two kinds of page-locked block a re-lay would
+    // have to touch. Off unless FNX_L2_DYN says otherwise, and it changes nothing either way.
+    l2::probe_pinned(m_, 0);
+    l2::probe_pinned(m_, 1);
 }
 
 void Engine::clear_rings() {
@@ -1067,6 +1074,9 @@ std::vector<unsigned> Engine::route_counts() const {
     std::vector<unsigned> v((size_t) 2 * NL * NEXP);
     ck(cudaSetDevice(b.dev), "set");
     ck(cudaMemcpy(v.data(), b.route_cnt, v.size() * sizeof(unsigned), cudaMemcpyDeviceToHost), "route counts");
+    // the tally lands here at the pass boundary, which is where a re-lay would happen too: hand it to step 0's
+    // dry-run (a table read and a few lines to stderr; nothing of the engine's moves)
+    if (l2::dyn_mode() >= 1) l2::note_route_counts(m_, v.data(), v.size());
     return v;
 }
 
