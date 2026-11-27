@@ -55,6 +55,8 @@ inside the bundled `docs/`.
 | Decode also computed on the 5070 | `FNX_L2_DEC` | 1 (when L2 is on) / never exported with L2 off |
 | Decode L2 hit statistics, one line per 512 requests | `FNX_L2_DEC_STATS` | 0 |
 | Picks one window may send to the 5070 (retreat knob) | `FNX_L2_DEC_MAX` | 0 = no limit |
+| Decode split: L1/L2/L3 counts and the host worker / 5070 ms (3 lines a sample) | `FNX_DEC_STATS` | 0 (a branch only while off) |
+| Windows folded into one sample | `FNX_DEC_STATS_EVERY` | 2048 |
 | Chunked GDN (sub-chunk width auto-selected from the card's opt-in shared memory) | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1 (sm_75 = 16 columns = 57,988 B) / 0 |
 | GDN numeric compare / timing | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Diagnostics when Prefill fails | `FNX_PF_ERRDBG` | 0 |
