@@ -25,6 +25,35 @@
 
 **Kostenlos, Open Source und ganz in deiner Hand.** Nutze Strata auf dem Desktop oder mit deinen liebsten Coding-Tools. Kein Konto nötig.
 
+
+## Was dieses Fork vom Upstream unterscheidet
+
+Dieser Baum ist ein Hardware-spezifischer Fork von [Strata](https://github.com/Niko1221/Strata). Jedes
+zusätzliche Verhalten liegt hinter einem Schalter, der standardmäßig aus ist – eine normale Installation
+verhält sich also wie das Upstream. Engine-Diff, Prüfskripte und diese Notizen sind von KI geschrieben; ein
+Mensch hat nur die Kommandos ausgeführt und die Messwerte eingesammelt.
+
+**Der Unterschied zum Upstream**
+
+- **Turing (`sm_75`) Tensor-Parallel über NVLink** – für zwei umgebaute RTX 2080 Ti 22 GB an OCuLink
+  (PCIe Gen3 x4): eigener NVLink-P2P-Direct-Exchange, RCCL und ein CPU-hybrider TP-Pfad, der in `futex park`
+  wartet statt zu spinnen.
+- **Eine dritte, andere GPU als L2-Expertenschicht (RTX 5070 / `sm_120`)** – Prefill läuft auf der 5070 mit
+  `sm_120 HMMA.16816` Streaming-GEMM und fp16-Addenden (10K-Klasse kalt **1.418–1.432 tok/s**, `tier compute`
+  rund 1.912 → 279 ms); Decode teilt jede MoE-Runde im Router einmal in L1 / L2 / L3 und die Arena-Hälfte
+  beantwortet die 5070; ein kurzer Prefill-Pass gibt nur seine ständigen Experten an die Schicht ab
+  (**5 tok fixed 509 ms → 300 ms**).
+- **Die Host-pinned-Kopie der Arena kommt zurück (`FNX_L2_DROP_HOST=1|2`)** – die page-locked Originale der in der
+  Arena wohnenden Experten werden nach dem Laden Lage für Lage zurückgegeben (**5,14–5,26 GiB**), der Peak bleibt
+  flach; auf dem 8010-Produktionsrechner fiel `shared` von 25 auf 20 GiB und `available` stieg von 10 auf 20 GiB.
+  Ein Rumpf-Pass, der zu kurz zum Strömen ist, fällt auf die Schicht zurück, statt ein zurückgegebenes Original zu
+  lesen – erst damit passt `MLOCK_MAX_GIB=10` in 64 GB RAM.
+- **Die Standardwerte rühren sich nicht** – jeder neue Knopf ist standardmäßig aus (und wird ohne L2-Schicht gar
+  nicht exportiert), sodass Upstream-Verhalten und die Zahlen der 2-Karten-Konfiguration stehen bleiben.
+
+Schaltertabelle und Messhistorie: [`README_tp_opt.en.md`](../../README_tp_opt.en.md) (Englisch),
+[`README_tp_opt.md`](../../README_tp_opt.md) (Japanisch).
+
 ## Modelle
 
 Wir empfehlen **zuerst ISTA-DASLab**, danach **Unsloth** und andere Anbieter, soweit ein passendes Modell in deinen Speicher passt.

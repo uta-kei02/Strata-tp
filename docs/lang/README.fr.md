@@ -25,6 +25,35 @@
 
 **Gratuit, open source, et à vous de l'exécuter.** Utilisez Strata sur votre bureau ou avec vos outils de programmation préférés. Aucun compte nécessaire.
 
+
+## Ce que ce fork change par rapport à l'amont
+
+Cet arbre est un fork matériel-spécifique de [Strata](https://github.com/Niko1221/Strata). Chaque comportement
+ajouté se trouve derrière un commutateur désactivé par défaut : une installation ordinaire garde donc le
+comportement amont. Le diff engine, les scripts de contrôle et ces notes sont écrits par une IA ; l'humain n'a
+que lancé les commandes et relevé les mesures.
+
+**Les différences avec l'amont**
+
+- **Tensor parallel Turing (`sm_75`) sur NVLink** — pour deux RTX 2080 Ti 22 GB modifiées branchées sur OCuLink
+  (PCIe Gen3 x4) : échange direct P2P NVLink sur mesure, RCCL, et un chemin TP CPU hybride qui attend en
+  `futex park` au lieu de tourner en boucle.
+- **Un troisième GPU différent en couche L2 d'experts (RTX 5070 / `sm_120`)** — le Prefill se calcule sur la 5070
+  avec le GEMM streaming `sm_120 HMMA.16816` et des addendes fp16 (10K à froid **1 418-1 432 tok/s**, `tier
+  compute` environ 1 912 → 279 ms) ; le Decode classe chaque tour MoE une fois dans le routeur en L1 / L2 / L3 et
+  la moitié de l'arena est répondue par la 5070 ; une passe Prefill courte ne confie que ses experts résidents à
+  la couche (**5 tok fixed 509 ms → 300 ms**).
+- **La copie pinned hôte de l'arena est rendue (`FNX_L2_DROP_HOST=1|2`)** — les originaux page-locked des experts
+  hébergés dans l'arena sont rendus couche par couche après le chargement (**5,14-5,26 GiB**) ; sur la machine de
+  production 8010, `shared` est passé de 25 à 20 GiB et `available` de 10 à 20 GiB. Une passe de queue trop courte
+  pour être streamée retourne sur la couche au lieu de lire un original rendu : c'est ce qui fait tenir
+  `MLOCK_MAX_GIB=10` dans 64 Go de RAM.
+- **Les valeurs par défaut ne bougent pas** — chaque nouveau commutateur est désactivé par défaut (et même pas
+  exporté sans couche L2), le comportement amont et les chiffres de la configuration à 2 cartes restent donc intacts.
+
+Tableau des commutateurs et historique des mesures : [`README_tp_opt.en.md`](../../README_tp_opt.en.md) (anglais),
+[`README_tp_opt.md`](../../README_tp_opt.md) (japonais).
+
 ## Modèles
 
 Nous recommandons **d'abord ISTA-DASLab**, puis **Unsloth** et d'autres fournisseurs, lorsqu'un modèle compatible tient en mémoire.

@@ -25,6 +25,34 @@
 
 **Bezpłatna, z otwartym kodem źródłowym i do uruchomienia u siebie.** Używaj Straty na swoim komputerze albo razem z ulubionymi narzędziami do programowania. Konto nie jest potrzebne.
 
+
+## Czym ten fork różni się od gałęzi głównej
+
+To drzewo jest forkiem konkretnego sprzętu [Strata](https://github.com/Niko1221/Strata). Każde dodane zachowanie
+siedzi za przełącznikiem, który domyślnie jest wyłączony — więc zwykła instalacja zachowuje się tak jak gałąź
+główna. Diff silnika, skrypty kontrolne i te notki napisało AI; człowiek tylko odpalał polecenia i zbierał liczby
+z pomiarów.
+
+**Główne różnice wobec gałęzi głównej**
+
+- **Równoległość tensorowa Turing (`sm_75`) przez NVLink** — dla dwóch przerobionych RTX 2080 Ti 22 GB wiszących na
+  OCuLink (PCIe Gen3 x4): własna wymiana bezpośrednia P2P NVLink, RCCL i hybrydowa ścieżka TP CPU, która czeka w
+  `futex park` zamiast kręcić się.
+- **Trzecia, inna karta jako warstwa L2 ekspertów (RTX 5070 / `sm_120`)** — Prefill liczy się na 5070 przez
+  strumieniowy GEMM `sm_120 HMMA.16816` z dodawanymi fp16 (10K na zimno **1 418–1 432 tok/s**, `tier compute` ok.
+  1 912 → 279 ms); Decode klasyfikuje każdą rundę MoE raz w routerze do L1 / L2 / L3, a połowę areny odpowiada
+  5070; krótkie przejście Prefill oddaje warstwie tylko swoich stale obecnych ekspertów
+  (**5 tok fixed 509 ms → 300 ms**).
+- **Zwrot kopii pinned hosta areny (`FNX_L2_DROP_HOST=1|2`)** — oryginały page-locked ekspertów trzymanych w arenie
+  są oddawane warstwa po warstwie po wczytaniu (**5,14–5,26 GiB**), a szczyt pozostaje płaski; na serwerze
+  produkcyjnym 8010 `shared` spadło z 25 do 20 GiB, a `available` wzrosło z 10 do 20 GiB. Dzięki temu
+  `MLOCK_MAX_GIB=10` mieści się w 64 GB RAM.
+- **Wartości domyślne się nie ruszają** — każdy nowy przełącznik jest domyślnie wyłączony (i w ogóle nie jest
+  eksportowany bez warstwy L2), więc zachowanie gałęzi głównej i liczby konfiguracji 2 kart zostają bez zmian.
+
+Tabela przełączników i historia pomiarów: [`README_tp_opt.en.md`](../../README_tp_opt.en.md) (angielski),
+[`README_tp_opt.md`](../../README_tp_opt.md) (japoński).
+
 ## Modele
 
 Najpierw polecamy **ISTA-DASLab**, potem **Unsloth** i innych dostawców — o ile zgodny model mieści się w pamięci.

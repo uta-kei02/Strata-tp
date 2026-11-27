@@ -25,6 +25,35 @@
 
 **Gratuito, de código aberto e seu para executar.** Use o Strata no desktop ou com suas ferramentas de programação favoritas. Não precisa de conta.
 
+
+## O que este fork muda em relação ao original
+
+Esta árvore é um fork específico de hardware do [Strata](https://github.com/Niko1221/Strata). Cada
+comportamento adicionado fica atrás de uma chave desligada por padrão, então uma instalação comum continua se
+comportando como o original. O diff do engine, os scripts de checagem e estas notas foram escritos por IA; o que
+a pessoa fez foi rodar os comandos e coletar os números medidos.
+
+**Diferenças em relação ao original**
+
+- **Paralelismo de tensores Turing (`sm_75`) sobre NVLink** — feito para duas RTX 2080 Ti 22 GB modificadas ligadas
+  em OCuLink (PCIe Gen3 x4): troca direta P2P NVLink própria, RCCL e um caminho TP híbrido de CPU que espera em
+  `futex park` em vez de girar.
+- **Uma GPU diferente e extra como nível L2 de peritos (RTX 5070 / `sm_120`)** — o Prefill roda na 5070 com o GEMM
+  streaming `sm_120 HMMA.16816` e parcelas fp16 (10K frio **1.418-1.432 tok/s**, `tier compute` de cerca de
+  1.912 → 279 ms); o Decode classifica cada rodada MoE uma vez no roteador em L1 / L2 / L3 e a metade da arena a
+  5070 responde; uma passada curta de Prefill entrega ao nível apenas os peritos residentes
+  (**5 tok fixed 509 ms → 300 ms**).
+- **A cópia pinned do host da arena é devolvida (`FNX_L2_DROP_HOST=1|2`)** — os originais page-locked dos peritos
+  alojados na arena são devolvidos camada por camada depois do carregamento (**5,14-5,26 GiB**) e o pico continua
+  plano; na máquina de produção 8010 `shared` caiu de 25 para 20 GiB e `available` subiu de 10 para 20 GiB. Uma
+  passada final curta demais para streaming cai de volta no nível em vez de ler um original devolvido, e é assim
+  que `MLOCK_MAX_GIB=10` cabe em 64 GB de RAM.
+- **Os padrões não se movem** — cada botão novo está desligado por padrão (e nem é exportado sem o nível L2), então
+  o comportamento original e os números da configuração de 2 placas continuam os mesmos.
+
+Tabela de chaves e histórico das medições: [`README_tp_opt.en.md`](../../README_tp_opt.en.md) (inglês),
+[`README_tp_opt.md`](../../README_tp_opt.md) (japonês).
+
 ## Modelos
 
 Recomendamos **primeiro a ISTA-DASLab**, depois a **Unsloth** e outros provedores, quando um modelo compatível cabe na memória.

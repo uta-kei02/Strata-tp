@@ -25,6 +25,26 @@
 
 **免费、开源，由你自己运行。** 在桌面上使用 Strata，或搭配你喜欢的编程工具。无需账号。
 
+
+## 本 fork（Strata-tp）与上游的区别
+
+本代码树是 [上游 Strata](https://github.com/Niko1221/Strata) 针对本机硬件的改造分支。新增行为都放在默认关闭的
+开关后面，因此常规使用仍与上游一致。engine 的改动、校验脚本与这些说明全部由 AI 编写（人只负责执行命令和收集实测数值）。
+
+**与上游的主要区别**
+
+- **Turing（`sm_75`）双卡 NVLink 张量并行** - 面向经 OCuLink（PCIe Gen3 x4）外接的两张改造 RTX 2080 Ti 22GB：自定义
+  NVLink P2P direct exchange、RCCL，CPU Hybrid TP 的等待改为 `futex park`。
+- **把另一代显卡（RTX 5070 / `sm_120`）作为 L2 专家专用层** - Prefill 在 5070 上以 `sm_120 HMMA.16816` 流式 GEMM 与
+  fp16 加数运算（10K 级 cold **1,418〜1,432 tok/s**、`tier compute` 约 1,912 → 279 ms）；Decode 由 router 一次性把每轮
+  划分到 L1 / L2 / L3，arena 部分由 5070 承担；短文 Prefill 只把常驻专家交给该层（**5 tok fixed 509 ms → 300 ms**）。
+- **交还 L2 常驻专家的 Host pinned 副本（`FNX_L2_DROP_HOST=1|2`）** - 载入后按「逐层：仅为存活者分配 pinned → 重建表 →
+  立即释放旧 block」归还 RAM 原本（**归还 5.14〜5.26 GiB**；生产 8010 上 `shared` 25 → 20 GiB、`available` 10 → 20 GiB）。
+  不足以流式的尾数 pass 会回落至该层，而不会去读已归还的副本，因此 64 GB RAM 内可容纳 `MLOCK_MAX_GIB=10`。
+- **默认值不变** - 新增开关默认 off（无 L2 层时根本不 export），未配置时保持上游行为与双卡数值。
+
+开关表与实测经过见 [`README_tp_opt.md`](../../README_tp_opt.md)（日语）。
+
 ## 模型
 
 我们**首先推荐 ISTA-DASLab**，其次是 **Unsloth** 和其他提供方，前提是有内存放得下的兼容模型。
