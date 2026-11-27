@@ -748,10 +748,14 @@ void record_pairs(int k, void* st_in) {
         throw std::runtime_error("l2pf: the card could not mark its rows ready for the tier");
 }
 
-bool plan(Model& m, int rows, int nk) {
+bool plan(Model& m, int rows, int nk, bool stream) {
     S& s = g();
     Ctx& c = const_cast<Ctx&>(ctx());
     if (!s.ok) return false;
+    // stream=false is the resident-only ask (M3-1): the tier takes what its arena holds and nothing else, so a short
+    // prompt can run with the RAM copies given back. The slots keep whatever the last pass sized them to; nothing
+    // streams into them this time, so a stale size cannot move a byte.
+    const bool do_stream = stream && s.stream;
     s.pass = false;
     s.filled_to = -1;   // a new pass fills its slots from the first layer again
     for (int q = 0; q < XRING_MAX; ++q) s.prev_read[q] = -1;   // ... and every rows slot starts unread
@@ -759,7 +763,7 @@ bool plan(Model& m, int rows, int nk) {
         std::fill(s.tm_step.begin(), s.tm_step.end(), (unsigned char) 0);
         std::fill(s.tm_fill.begin(), s.tm_fill.end(), (unsigned char) 0);
     }
-    if (nk < 1 || nk > PF_PASS_MAX || rows < MAXT) return false;
+    if (nk < 1 || nk > PF_PASS_MAX || rows < (do_stream ? MAXT : 1)) return false;
     if (rows > s.max_rows) {   // wider than the rows buffers were sized for: the cards run this pass, and say so once
         static int told = 0;   // or it would fall back silently, with nothing in the log to compare a bench against
         if (env_flag("FNX_PF_TIMING") || told < 3) {
@@ -808,7 +812,7 @@ bool plan(Model& m, int rows, int nk) {
         // slots by: measure every layer first, cut once, and a layer whose need fits its slot hands the cards nothing
         // at all to copy up the link (a pass line of "0 MiB copied in"). The cut below only bites when the tier
         // really has no room for a layer, which is the same short fill a too-small slot always was.
-        if (s.stream) {
+        if (do_stream) {
             size_t need = 0;
             for (int e = 0; e < NEXP; ++e) {
                 const size_t i = (size_t) l * NEXP + e;
@@ -820,11 +824,11 @@ bool plan(Model& m, int rows, int nk) {
     }
     // one pass, one cut: nothing of it has been enqueued yet and no device memory has been touched here, so moving the
     // slots now costs the pass nothing and every table below is built against the slots that will really hold them
-    if (s.stream) split_slots(s, need_max);
+    if (do_stream) split_slots(s, need_max);
     for (int l = 0; l < NL; ++l) {
         const size_t tot = stride[(size_t) l];
         if (!tot) continue;
-        const bool str_ok = s.stream && s.slot_bytes > 0;
+        const bool str_ok = do_stream && s.slot_bytes > 0;
         int k = 0;
         for (int e = 0; e < NEXP; ++e) {
             const size_t i = (size_t) l * NEXP + e;

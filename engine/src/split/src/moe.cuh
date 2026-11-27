@@ -85,6 +85,10 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
             const int g = base + w;
             if (ec.slot_of[g] >= 0) continue;
             if (freq[g] < 255) continue;
+            // FNX_L2_DROP_HOST: an expert that gave its RAM copy back lives only in the tier's arena, and this plan
+            // is what k_cache_copy reads (kernels.cu:1822) - so with no original it cannot be promoted to the first
+            // tier. The tier answers it instead, which is the same answer.
+            if (!ec.host_gu[g] || !ec.host_dn[g]) continue;
 
             int victim = -1;
             int min_sc = 999999;

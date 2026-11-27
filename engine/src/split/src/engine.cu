@@ -7,6 +7,7 @@
 #include "peer_probe.hpp"
 #include "pf_pick.hpp"
 #include "l2_dec.hpp"
+#include "l2_offload.hpp"
 #include "dec_stats.hpp"
 
 #include <cuda_runtime.h>
@@ -808,6 +809,12 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(std::min(max_
             throw std::runtime_error("FNX_RING_TAG_START: want 1.." + std::to_string(TAG_END - 1) + ", got " + std::to_string(v));
         tag_max_ = (unsigned) v;
     }
+    // M3-1: the tier is up (model.cpp's load called l2::setup), the prompt path has taken its slots (prefill_stages
+    // -> l2_pf::setup) and decode has taken its map (l2::dec::open above), so an arena expert is answered by the
+    // tier on both paths. This is the last point at which nothing is running: no window has been captured, no round
+    // is going, and the host worker only reads these mirrors when a request arrives. So the copies the arena made
+    // redundant can be given back here and nothing else has to know the order.
+    l2::drop_host(m_);
 }
 
 void Engine::clear_rings() {

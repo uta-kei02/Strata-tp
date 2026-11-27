@@ -14,6 +14,7 @@
 #include "env.hpp"
 #include "pf_ring_plan.hpp"
 #include "l2_pf.hpp"   // rev.15-M2b-1: the routed experts on an opt-in third card
+#include "l2_offload.hpp"   // rev.15-M3-1: FNX_L2_DROP_HOST asks a short pass to run the arena's experts on the tier
 #include "../../tpopt/tp_opt.hpp"
 #if FNX_HIP
 #endif
@@ -1555,6 +1556,24 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             ckc(cudaMemcpyAsync(p.ep_gu, p.ep_hgu, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice, b.st), "tables");
             ckc(cudaMemcpyAsync(p.ep_dn, p.ep_hdn, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice, b.st), "tables");
         });
+    }
+    else if (l2::ctx().dropped) {
+    // rev.15-M3-1 (FNX_L2_DROP_HOST): a pass that does not stage - 1..FNX_PF_STAGE_ROWS-1 tokens, the 1,100-row
+    // warm-up, a 64-token prompt, a 4-row tail - used to read every expert from its page-locked copy in place. For
+    // the arena's experts that copy is gone, so the tier takes exactly those: stream=false means no slot is sized,
+    // no byte is copied up, and the cards keep (and read) every expert the arena does not hold. The run table below
+    // then masks the arena's experts out of both cards' jobs, so a Turing kernel never sees the null left in ep.
+    pf_tier = l2::pf::use() && l2::pf::plan(m_, pf_rows, nk, /*stream=*/false);
+    }
+    if (l2::ctx().dropped && !pf_tier) {
+        // With the copies handed back there is nothing for a card to read for these experts: it would fault on the
+        // null (Xid 31), so a pass the tier will not take is named rather than quietly computed wrong.
+        static int told = 0;
+        if (told < 3) {
+            ++told;
+            std::fprintf(stderr, "fnx: l2pf: off: a %d rows x %d chunks pass has no tier after FNX_L2_DROP_HOST:"
+                                 " the cards no longer hold a host copy of the arena's experts\n", pf_rows, nk);
+        }
     }
     // layer l's experts into stage[l & 1] once the layer two before is done with it
     auto stage_in = [&](int l) {

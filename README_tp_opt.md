@@ -29,6 +29,8 @@ expert コピーを 5070 側の演算へ載せ替えた改造です。変更は 
 | rev.15-M2b-1v | 988.1 tok/s（+18.7 %） | 54.62 tok/s | chunk 行を 5070 専属 lane へ / card 別の addend event / 2080 Ti と 5070 の重複実行（origin へ push 済み） |
 | rev.15-M2b-1w | **1,099.4 tok/s（+11.3 %）** / 4,096 行 pass 単体 1,248.1 | 55.04 tok/s / 28.82 ms | 加算項を f16 行へ（host 中継 1,920 → 960 MiB / card・pass）・card 0 の行 mark を router 前へ・`FNX_PF_PASS` 透過（`PASS=4` は 913.0 tok/s・Decode 51.11 へ低下で不採用） |
 | rev.15-M2b-2 | 1,099.4 tok/s（Prefill は不変） | 実測待ち（従来 55.04） | Decode の 1 軍を 5070 の L2 でも演算（router が 1 回で L1 / L2 / L3 へ排他分類）。実装・静的検証済み / 実機ベンチ待ち |
+| rev.15-M2b-2（実測） | 895.1 tok/s（`FNX_L2_DEC=1`） | **55.46 tok/s / 28.42 ms** | 5/5 完走・Xid 0・ring error 0・全パス 0 MiB copied in。5070 の hit 82,252 / 82,432 request（card 0/1 対称）/ retire 0 件 |
+| rev.15-M2c-arch | **1,410.3 tok/s（+71 %）** | 実測待ち（従来 55.46） | MoE MMA の命令幅を device arch で選択（5070 = `sm_120` は `HMMA.16816.F32`、2080 Ti = `sm_75` は従来どおり）。`tier compute` 約 1,912 → 279 ms |
 
 次マイルストーンは **1,500 tok/s**（7,609 tok を 5.1 s 以内 / 現在 6.9 s）。Decode 側は M2b-2 の
 5070 L2 合流が実装済みで、実機ベンチ（A = `FNX_L2_DEC=1` / B = `FNX_L2_DEC=0`）待ちです。その次が
@@ -55,6 +57,7 @@ M3（5070 を入口の 1 次キャッシュへ / 3 階層 2 段階スワップ�
 | 1 window が 5070 へ送る pick 上限（撤退ノブ） | `FNX_L2_DEC_MAX` | 0 = 上限なし |
 | Decode の L1/L2/L3 内訳（件数と host worker・5070 の ms、3 行/サンプル） | `FNX_DEC_STATS` | 0（off は分岐 1 回のみ） |
 | 1 サンプルにまとめる window 数 | `FNX_DEC_STATS_EVERY` | 2048 |
+| 5070 arena 常駐 expert の host 原本をロード後に返却（M3-1） | `FNX_L2_DROP_HOST` | 0（1 は arena + `FNX_L2_PF` + `FNX_L2_DEC` + 両 card の表が揃うときだけ発火。揃わなければ警告して off） |
 | chunked GDN（sub-chunk 幅は card の opt-in 共有メモリから自動選択） | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1（sm_75 は 16 列 = 57,988 B）/ 0 |
 | GDN 数値比較・時間計測 | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Prefill 失敗時の診断印字 | `FNX_PF_ERRDBG` | 0 |
