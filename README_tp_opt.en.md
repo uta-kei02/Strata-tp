@@ -12,7 +12,7 @@ compute that runs on the 5070. The changes stay inside `engine/src/split/src/` a
 | Item | Value |
 |---|---|
 | Upstream base SHA | `3142b66b96e9c0e775e30f620b11b191a1427c2a` (main) |
-| Work branch | `feat/m3-1-l2-host-dedup` (rev.15-M3-1b) |
+| Work branch | `feat/m3-2-dynamic-l2` (rev.15-M3-2 step 1; prev `feat/m3-1-l2-host-dedup`) |
 | Push remote (origin) | https://github.com/uta-kei02/Strata-tp.git |
 | Upstream | push disabled (`git remote set-url --push upstream DISABLED`) |
 | Diff | `git diff --binary 3142b66b9` (same content as the bundled `patches/strata_tp_opt.patch`) |
@@ -35,12 +35,13 @@ compute that runs on the 5070. The changes stay inside `engine/src/split/src/` a
 | rev.15-M3-1a | - | - | Turing gets its tensor cores back too: the width choice in `moe_mma.cuh` now opens at `__CUDA_ARCH__ >= 750`, and `sm_75` builds the K=16 dot from two `mma.m16n8k8`. SASS check: `sm_75` shows `HMMA.1688.F32` 640 times and no `HMMA.884`, `sm_120` keeps `HMMA.16816.F32` 320 times |
 | rev.15-M3-1 (three measured runs) | 1,419.4 / 1,432.3 / 1,418.3 tok/s | 50.15 / 51.99 / **51.48 tok/s / 30.54 ms** | The page-locked Host originals of the experts resident in the 5070 arena are handed back one layer at a time (1,713 experts / 3.38 GiB, 2,622 / 5.26 GiB, 2,563 / 5.14 GiB). What is handed back only exists in the arena, so a short pass gives the tier only its resident experts (5 tok fixed 308.0 / 300.0 / 311.0 ms). Major faults 454.5 -> 344.0 per s. No Xid and no OOM in any run |
 | rev.15-M3-1b (production 8010) | - | short round trips ok | A tail pass shorter than `MAXT` = 16 rows now falls back onto the tier instead of reading a handed-back original. The repro passes at 2,089 tokens (41 left, 3.07 s) and 4,110 tokens (14 left, 6.96 s) with 0 `l2pf: off` lines and 0 `stage copy` errors. On 8010 the drop returned 2,620 experts / 5.25 GiB (10.35 s) alongside `MLOCK_MAX_GIB=10` |
+| rev.15-M3-2 step 1 (three measured runs) | **1,445.4 tok/s (+2.5 %)** | **52.25 tok/s / 30.24 ms** | The 5070 arena becomes the entry-level primary cache: at a pass boundary the experts with the most routes swap 1-for-1 with the arena (`FNX_L2_DYN=2`, N=64), and the evicted expert takes over the Host row the newcomer leaves, so RAM does not grow. Arena coverage goes **15.0% -> 23.4 %** on the 10K prefill band and **12.7% -> 16.4 %** on the decode band. `5 tok fixed` 293.0 -> 248.0 ms, major faults 411.2 -> 399.3 per s. With `VERIFY=1` all 10 boundaries matched (640 rows, 0 mismatch). No Xid and no OOM in any run |
 
-The fastest Prefill so far is M2c-arch at **1,410.3 tok/s**; the next **1,500 tok/s** (7,609 tokens
-within 5.1 s, today 6.9 s) lives on the first-tier swap and the K/V side, not on the 5070's instruction
-width. M3-1 is done up to handing the Host copies back; next is M3-2 (the 5070 arena as the entry-level
-primary cache, a 3-tier promotion path). The design and the reserved hooks are in
-`m2_design_rtx5070_l2.md` and `m3_plan.md` inside the bundled `docs/`.
+The fastest Prefill so far is M3-2 step 1 at **1,445.4 tok/s** (+2.5 % over M2c-arch at 1,410.3); the next
+**1,500 tok/s** (7,609 tokens within 5.1 s, today 5.3 s) lives on first-tier coverage and the K/V side, not
+on the 5070 instruction width. M3-1 is done up to handing the Host copies back, and M3-2 step 1 is done up to
+the 1-for-1 swap at the pass boundary. Next is M3-2 step 2 (promote on hits during Decode) and the K/V side.
+The design and the reserved hooks are in `m2_design_rtx5070_l2.md` and `m3_plan.md` inside the bundled `docs/`.
 
 ## Switches read by the engine (default off)
 
@@ -63,6 +64,10 @@ primary cache, a 3-tier promotion path). The design and the reserved hooks are i
 | Decode split: L1/L2/L3 counts and the host worker / 5070 ms (3 lines a sample) | `FNX_DEC_STATS` | 0 (a branch only while off) |
 | Windows folded into one sample | `FNX_DEC_STATS_EVERY` | 2048 |
 | Hand back the Host copy of the experts resident in the 5070 arena after load (M3-1) | `FNX_L2_DROP_HOST` | 0 (1 arms only when the arena, `FNX_L2_PF`, `FNX_L2_DEC` and both cards' tables are all in place; otherwise it warns and stays off; 2 also hands back the resident experts that keep a first-tier swap slot) |
+| Moving the 5070 arena around (M3-2) | `FNX_L2_DYN` | 0 (a branch only while off; 1 runs the host-pinned probe and a dry run that moves no weights, tables or maps; 2 relays one-for-one at the pass boundary) |
+| Most pairs a single boundary may swap | `FNX_L2_DYN_N` | 64 (0 = no cap) |
+| Picks below which a boundary is skipped (no thrashing on a five-token ask) | `FNX_L2_DYN_MIN_PICKS` | 16384 |
+| Checksum the rows that moved and stop safely on a mismatch | `FNX_L2_DYN_VERIFY` | 0 |
 | Chunked GDN (sub-chunk width auto-selected from the card's opt-in shared memory) | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1 (sm_75 = 16 columns = 57,988 B) / 0 |
 | GDN numeric compare / timing | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Diagnostics when Prefill fails | `FNX_PF_ERRDBG` | 0 |

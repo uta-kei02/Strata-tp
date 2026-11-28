@@ -30,6 +30,53 @@ inline long long requested_device() { return env_int("FNX_L2_GPU", -1); }
 inline long long promote_thresh() { return env_int("FNX_L2_PROMOTE_THRESH", 3); }
 inline long long demote_thresh() { return env_int("FNX_L1_DEMOTE_THRESH", 0); }
 
+// M3-2 (docs/m3_plan.md sec.9): the arena stops being a fixed set and becomes a dynamic first-tier cache. The steps
+// are measured before they move anything, so 1 is step 0 (read-only probes plus the dry-run of one pass's picks), 2
+// is step 1 - the re-lay itself at a pass boundary, 1-for-1 - and 3 and above are left for the decode-side triggers.
+// 0 means none of it runs: at[], the cards' expert tables and both cards' tier maps keep what startup wrote, exactly
+// as rev.15-M3-1b. A value that is not a number is off too - a measurement knob must never be the reason a working
+// server stops.
+inline long long dyn_mode() {
+    try {
+        return env_int("FNX_L2_DYN", 0);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// how many experts one re-lay may move, and what step 0's dry-run sizes itself with. A re-lay moves pairs, so this is
+// pairs per boundary: 64 pairs of this model is 141 MiB each way, which at the pinned speed step 0 measured is a
+// hundredth of a second. 0 means as many as the arena holds now, which nobody wants while a server is answering.
+inline long long dyn_swap_n() {
+    try {
+        return env_int("FNX_L2_DYN_N", 64);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// the floor a re-lay will work for: fewer picks than this since the last look and the boundary is a five-token
+// question, where every ranking is noise and moving weights would be pure thrash (docs/m3_plan.md sec.9.11). The
+// default is the order of magnitude of one long prompt's picks, so a run of short asks never re-lays at all.
+inline long long dyn_min_picks() {
+    try {
+        return env_int("FNX_L2_DYN_MIN_PICKS", 16384);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// check the bytes: fold every victim's arena row before the copy and its newcomer's RAM row after, fold the other way
+// round too, and stop the re-lay for the rest of the run if one byte disagrees. Two kernel launches a boundary, so it
+// is a measuring knob and off by default.
+inline long long dyn_verify() {
+    try {
+        return env_int("FNX_L2_DYN_VERIFY", 0);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
 struct Ctx {
     int dev = -1;                      // the visible ordinal the arena lives on (-1: off)
     int major = 0, minor = 0;          // its compute capability: the cards' own check only looks at dev < NCARD
@@ -70,6 +117,27 @@ struct Ctx {
     //     not have to reshape what M2b/M2c put in place.
     std::vector<unsigned int> hits;   // [NL * NEXP]: per-slot hit count (decode will count it / 0 until then)
     size_t demote_room = 0;           // arena bytes still free = how much a card may demote onto the tier (0: none)
+
+    // --- M3-2's step 0 (FNX_L2_DYN, off by default): can this context reach the two kinds of page-locked block a
+    //     re-lay would have to read and write, and what would one pass's picks have covered after a re-lay. Sizes,
+    //     measurements and a dry-run only: none of it moves a weight, an entry of at[], a card table or a map.
+    std::vector<size_t> expert_bytes;   // [NL]: one expert of this layer, every card's slice of it together
+    std::vector<char*> new_host;        // [NCARD * NL]: drop_host's block for this card's layer (null: its old block stayed)
+    std::vector<size_t> new_host_bytes;  // [NCARD * NL]: the bytes of that block, so a row inside it can be measured
+
+    // one answer to one question: is a page-locked block that another context laid down usable from the tier?
+    struct Probe {
+        bool ran = false;             // the knob asked and the tier is up (otherwise the probe never ran at all)
+        bool found = false;           // a live block of this kind exists to sample
+        bool map_ok = false;          // cudaHostGetDevicePointer named it inside the tier's own context
+        bool h2d_ok = false, d2h_ok = false;
+        double h2d_gbs = 0, d2h_gbs = 0;   // what the tier reads out of it, and what it writes into it
+        int card = -1;                // whose block it sampled, since that card's context owns the allocation
+        size_t bytes = 0;             // the size it measured with
+        bool raw_ok = false;          // the raw host address worked too, so a re-lay would not need the mapped name
+        std::string why;              // what stopped it, when something did
+    };
+    Probe probe_mapped, probe_portable;   // model.cpp's Mapped block / drop_host's Mapped | Portable one
     // at[] as a tier number in one call (0: still in host RAM, 1: resident in the arena). M3's victim choice goes
     // through this, so adding a tier later does not touch the callers
     int tier_of(size_t i) const { return i < at.size() && at[i] >= 0 ? 1 : 0; }
@@ -86,6 +154,30 @@ void setup(Model& m);
 // no: a run that does not ask for it (or that fails one gate) keeps every byte exactly where M2b-2 left it. Call it
 // after l2::setup / l2::pf::setup / l2::dec::open and before anything computes.
 void drop_host(Model& m);
+
+// M3-2 step 0 (docs/m3_plan.md sec.9.5 / 9.8 / 9.9), behind FNX_L2_DYN: ask the tier's own context to name, read and
+// write one live page-locked block of the kind named. 0 is the block model.cpp mapped for the cards' host copies
+// (cudaHostAllocMapped, no Portable flag - sec.9.5's open question), 1 is the smaller block drop_host built from the
+// survivors (Mapped | Portable). A probe only ever reads a live block, and its write lands in a fresh buffer of the
+// same flags laid down by the same card's context, so no weight can be corrupted and no table is touched. What M3-2
+// needs to know before it moves a byte is exactly these two numbers; with the knob off nothing runs and nothing prints.
+void probe_pinned(Model& m, int kind);
+
+// M3-2 step 0's other half: the picks of the passes so far, as card 0's [decode | prompt][NL][NEXP]
+// counters (empty when FNX_ROUTE_COUNT is off, which the first line then says once). The dry-run only compares this
+// pass's hottest experts outside the arena with its coldest residents and prints what a 1-for-1 re-lay would have
+// covered. No weight, no at[], no expert table and no tier map moves, so the answers of the run do not change.
+void note_route_counts(Model& m, const unsigned* counts, size_t n);
+
+// M3-2 step 1 (docs/m3_plan.md sec.9.10 / 9.11), behind FNX_L2_DYN=2 and called at the same pass boundary as the
+// dry-run above: make that re-lay real. The hottest experts host RAM still holds take the arena rows of the coldest
+// residents, and every victim takes the newcomer's page-locked row in its place, so host RAM neither grows nor
+// shrinks and what M3-1 gave back stays given back (sec.9.8). Not one byte moves while anything is in flight: both
+// tier maps park the victims first, both cards and the tier are synchronized, and the tier's decode worker is idle.
+// A newcomer that also holds a first-tier VRAM slot keeps that slot's pointer, and so does a victim that does -
+// sec.9.9's rule, the one place a re-lay could otherwise point a card at a weight it no longer owns. With the knob
+// below 2 nothing here runs, so at[], the six card tables and both maps are exactly what startup wrote.
+void relay_picks(Model& m, const unsigned* counts, size_t n);
 
 }  // namespace l2
 }  // namespace fnx

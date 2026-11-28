@@ -11,7 +11,7 @@ expert コピーを 5070 側の演算へ載せ替えた改造です。変更は 
 | 項目 | 値 |
 |---|---|
 | 本家 base SHA | `3142b66b96e9c0e775e30f620b11b191a1427c2a`（main） |
-| 作業ブランチ | `feat/m3-1-l2-host-dedup`（rev.15-M3-1b） |
+| 作業ブランチ | `feat/m3-2-dynamic-l2`（rev.15-M3-2 step 1。prev `feat/m3-1-l2-host-dedup`） |
 | push 先（origin） | https://github.com/uta-kei02/Strata-tp.git |
 | 本家（upstream） | push 禁止（`git remote set-url --push upstream DISABLED`） |
 | 差分 | `git diff --binary 3142b66b9`（同梱の `patches/strata_tp_opt.patch` と同一内容） |
@@ -34,11 +34,13 @@ expert コピーを 5070 側の演算へ載せ替えた改造です。変更は 
 | rev.15-M3-1a | - | - | Turing 側でも Tensor Core を使わせる（`moe_mma.cuh` の命令幅選択を `__CUDA_ARCH__ >= 750` へ広げ、`sm_75` は `mma.m16n8k8` を 2 命令で組む）。SASS 実測 = `sm_75` は `HMMA.1688.F32` 640 本で `HMMA.884` は 0 本、`sm_120` は `HMMA.16816.F32` 320 本のまま |
 | rev.15-M3-1（実測 3 連） | 1,419.4 / 1,432.3 / 1,418.3 tok/s | 50.15 / 51.99 / **51.48 tok/s / 30.54 ms** | 5070 arena 常駐 expert の RAM 側 page-locked 原本を 1 層ずつ返却（1,713 exp / 3.38 GiB、2,622 exp / 5.26 GiB、2,563 exp / 5.14 GiB）。返した分は arena にしか無いので短文 pass は常駐分だけ tier へ渡す（5 tok fixed 308.0 / 300.0 / 311.0 ms）。majflt 454.5 → 344.0 回/s。全 run Xid 0・OOM 0 |
 | rev.15-M3-1b（本番 8010） | - | 短文往復 OK | 長文末尾の端数 pass（残りが `MAXT` = 16 行に満たない）も、返した原本を読みに行かず tier へ回落。再現テスト 2,089 tok（余り 41）3.07 s と 4,110 tok（余り 14）6.96 s が通り、`l2pf: off` 0 件・`stage copy` error 0 件。本番では返却 2,620 exp / 5.25 GiB（10.35 s）で `MLOCK_MAX_GIB=10` と同居 |
+| rev.15-M3-2 step 1（実測 3 連） | **1,445.4 tok/s（+2.5 %）** | **52.25 tok/s / 30.24 ms** | 5070 アレーナを入口の 1 次キャッシュへ。pass 境界で route 回数上位の expert を arena と 1-for-1 に入れ替え（`FNX_L2_DYN=2` / `N=64`）、追い出した expert へ空地の RAM 原本を戻すので RAM は増えない。カバー率は 10K prefill 帯 **15.0% → 23.4%**、decode 帯 **12.7% → 16.4%**。`5 tok fixed` 293.0 → 248.0 ms、majflt 411.2 → 399.3 回/s。`VERIFY=1` では 10 / 10 境界・640 ペアが一致（mismatch 0）。全 run 5/5 完走・Xid 0・OOM 0 |
 
-Prefill の現最速は M2c-arch の **1,410.3 tok/s** で、次の **1,500 tok/s**（7,609 tok を 5.1 s 以内 /
-現在 6.9 s）は 5070 の命令幅ではなく 1 軍 swap と K/V 側の話です。M3-1 は RAM 側の二重保持を返す段階
-まで完了し、次は M3-2（5070 アレーナを入口の 1 次キャッシュへ / 3 階層の昇降格）。設計と拡張点は
-同梱 `docs/` の `m2_design_rtx5070_l2.md` と `m3_plan.md` に置いてあります。
+Prefill の現最速は M3-2 step 1 の **1,445.4 tok/s**（M2c-arch の 1,410.3 から +2.5 %）で、次の
+**1,500 tok/s**（7,609 tok を 5.1 s 以内 / 現在 5.3 s）は 1 軍 swap の被覆と K/V 側の話です。M3-1 は RAM
+側の二重保持を返す段階まで、M3-2 step 1 は pass 境界の 1-for-1 入替まで完了しました。次は M3-2 step 2
+（decode 中の hit 駆動で逐次昇格）と K/V 側。設計と拡張点は同梱 `docs/` の `m2_design_rtx5070_l2.md` と
+`m3_plan.md` に置いてあります。
 
 ## engine が読むスイッチ（既定 off / 数値は実機で確認）
 
@@ -61,6 +63,10 @@ Prefill の現最速は M2c-arch の **1,410.3 tok/s** で、次の **1,500 tok/
 | Decode の L1/L2/L3 内訳（件数と host worker・5070 の ms、3 行/サンプル） | `FNX_DEC_STATS` | 0（off は分岐 1 回のみ） |
 | 1 サンプルにまとめる window 数 | `FNX_DEC_STATS_EVERY` | 2048 |
 | 5070 arena 常駐 expert の host 原本をロード後に返却（M3-1） | `FNX_L2_DROP_HOST` | 0（1 は arena + `FNX_L2_PF` + `FNX_L2_DEC` + 両 card の表が揃うときだけ発火。揃わなければ警告して off。2 は 1軍 swap slot を持つ arena 常駐分も返す） |
+| 5070 アレーナの動的入替（M3-2） | `FNX_L2_DYN` | 0（off は分岐 1 回のみ。1 = host pinned 実測と route 回数の dry-run 試算だけ。2 = pass 境界で 1-for-1 の実入れ替え） |
+| 1 境界あたりの入れ替えペア数の上限 N | `FNX_L2_DYN_N` | 64（0 = 上限なし） |
+| 入れ替えを見送る picks 数（短文のスラッシング防止） | `FNX_L2_DYN_MIN_PICKS` | 16384 |
+| 動いた行の check-sum 照合（不一致は安全停止） | `FNX_L2_DYN_VERIFY` | 0 |
 | chunked GDN（sub-chunk 幅は card の opt-in 共有メモリから自動選択） | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1（sm_75 は 16 列 = 57,988 B）/ 0 |
 | GDN 数値比較・時間計測 | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Prefill 失敗時の診断印字 | `FNX_PF_ERRDBG` | 0 |

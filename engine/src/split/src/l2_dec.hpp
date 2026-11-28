@@ -33,6 +33,27 @@ namespace dec {
 // pick itself, as it did before. Never throws; the first refusal prints one line with the reason and stays refused.
 bool open(int card, Model& m, CpuMoeBox* hbox);
 
+// M3-2 step 1 (docs/m3_plan.md sec.9.11), all three of them only for a re-lay at a pass boundary:
+//
+// quiescent(): is the tier answering nothing right now, so the arena's rows and the tables over them may be moved?
+// False for a tier that is off or broken, false while the worker is between taking a card's list and answering it,
+// and false while any card's list has gone unanswered. It never waits, so a caller that is not idle simply re-lays
+// at the next boundary instead of parking one inside a round.
+bool quiescent();
+
+// park(): stop both cards sending picks for `idx` (n entries of [NL * NEXP]) to the arena, leaving every other entry
+// exactly as it was. Nothing moves and no table changes, so relayout() below is the undo: the victims' arena rows
+// stay theirs the whole time. False: a map would not upload (it may be half written) - call relayout() and change
+// nothing else.
+bool park(const int* idx, size_t n);
+
+// relayout(): rebuild from l2::ctx().at[] as it is now what open() built at startup - each card's two expert tables
+// on the tier, then both cards' pick maps. The tables go first on purpose: a map that starts sending picks to an
+// expert must never reach it before the row behind those picks does. Bounds-checked the same way open() checks them,
+// so a re-lay that would point a card outside the arena is refused here rather than as an illegal access a layer
+// later. False: nothing was uploaded, and the tables still say what they said before.
+bool relayout();
+
 // the card's [NL * NEXP] pick map (1: the arena holds this expert, so the router may send a pick that missed the
 // card's slots there), in the card's own memory; null when the tier is off for it. Zeroing it at any moment is safe:
 // it only moves picks between the three lists, it can neither duplicate one nor drop one.
