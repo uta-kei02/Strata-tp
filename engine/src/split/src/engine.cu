@@ -1077,6 +1077,7 @@ std::vector<unsigned> Engine::route_counts() const {
     // the tally lands here at the pass boundary, which is where a re-lay would happen too: hand it to step 0's
     // dry-run (a table read and a few lines to stderr; nothing of the engine's moves)
     if (l2::dyn_mode() >= 1) l2::note_route_counts(m_, v.data(), v.size());
+    if (l2::dyn_mode() >= 2) l2::relay_picks(m_, v.data(), v.size());
     return v;
 }
 

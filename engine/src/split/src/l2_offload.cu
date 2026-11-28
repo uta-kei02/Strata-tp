@@ -29,6 +29,7 @@ constexpr size_t PROBE_PAGE_BYTES = 64 * MIB;    // the pageable compare, so the
 constexpr size_t PROBE_D2H_BYTES = 256 * MIB;    // arena -> pinned host
 constexpr size_t PROBE_XDEV_BYTES = 32 * MIB;    // FNX_L2_DYN: one cross-context read and one write of a RAM copy
 constexpr size_t PROBE_RAW_BYTES = 64 * 1024;    // the same block by its raw host address, with no mapped name
+constexpr size_t RELAY_STASH_MAX_BYTES = 512 * MIB;   // M3-2 step 1: the most one re-lay may park in page-locked scratch
 
 // one card's slice of one expert, straight out of its page-locked copy. The host side of an expert is one contiguous
 // [gate|up | down] block (model.cpp:971-974 writes it that way), so this is normally one DMA per card per expert.
@@ -110,6 +111,48 @@ void host_fold(const std::vector<Piece>& pieces, unsigned long long& sum, unsign
         sum += ps[(size_t) t];
         xr ^= px[(size_t) t];
     }
+}
+
+
+// Fold the arena's side of a byte range: one segment, the tier's own kernel, the same pair of numbers host_fold()
+// comes up with for the host's side of the same bytes. FNX_L2_DYN_VERIFY runs it on both sides of a re-lay
+// (docs/m3_plan.md sec.9.11); the caller stands in the tier's context and owns dseg / dfold.
+bool arena_fold(const char* arena, unsigned long long off, size_t len, Seg* dseg, unsigned long long* dfold,
+                unsigned long long& sum, unsigned long long& xr) {
+    const Seg sg{off, (unsigned long long) len};
+    if (cudaMemset(dfold, 0, 2 * sizeof(unsigned long long)) != cudaSuccess) return false;
+    if (cudaMemcpy(dseg, &sg, sizeof sg, cudaMemcpyHostToDevice) != cudaSuccess) return false;
+    k_fold_one<<<1024, 256>>>(arena, dseg, 1, dfold);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    unsigned long long out[2] = {0, 0};
+    if (cudaMemcpy(out, dfold, sizeof out, cudaMemcpyDeviceToHost) != cudaSuccess) return false;
+    sum = out[0];
+    xr = out[1];
+    return true;
+}
+
+// The one question a 1-for-1 re-lay has to ask: are these two layers described alike on every card, so the bytes a
+// newcomer sends are the bytes the victim's arena row holds? The pool's row layout (dn_off, slot_bytes) and the host
+// row's two strides (gate|up, down) answer it, four numbers per card, and nothing else may. The dry-run and the
+// re-lay build the key here so they can never drift apart (docs/m3_plan.md sec.9.8).
+std::vector<unsigned long long> shape_key(Model& m, int l) {
+    std::vector<unsigned long long> k;
+    if (l < 0 || l >= NL) return k;
+    k.reserve((size_t) NCARD * 4);
+    for (int t = 0; t < NCARD; ++t) {
+        const CardW& cw = m.cards[(size_t) t];
+        const int p = cw.ec.pool_of[l];
+        if (p < 0 || p >= EC_POOLS) {
+            k.clear();
+            return k;
+        }
+        k.push_back((unsigned long long) cw.ec.dn_off[p]);
+        k.push_back((unsigned long long) cw.ec.slot_bytes[p]);
+        k.push_back((unsigned long long) cw.L[(size_t) l].gu_e_stride);
+        k.push_back((unsigned long long) cw.L[(size_t) l].down_e_stride);
+    }
+    return k;
 }
 
 // The tier's context for the length of one block. l2_dec.cu has its own guard for the same job; this file's probes
@@ -921,24 +964,7 @@ void note_route_counts(Model& m, const unsigned* counts, size_t n)
     // A newcomer takes the victim's arena row and the victim takes the newcomer's RAM rows, so one 1-for-1 swap needs
     // the two layers described alike on every card: the pool's row layout (dn_off, slot_bytes) and the host row
     // (gate|up and down strides). Those four numbers per card are the key; docs/m3_plan.md sec.9.8.
-    const auto shape_of = [&](int l) {
-        std::vector<unsigned long long> k;
-        if (l < 0 || l >= NL) return k;
-        k.reserve((size_t) NCARD * 4);
-        for (int t = 0; t < NCARD; ++t) {
-            const CardW& cw = m.cards[(size_t) t];
-            const int p = cw.ec.pool_of[l];
-            if (p < 0 || p >= EC_POOLS) {
-                k.clear();
-                return k;
-            }
-            k.push_back((unsigned long long) cw.ec.dn_off[p]);
-            k.push_back((unsigned long long) cw.ec.slot_bytes[p]);
-            k.push_back((unsigned long long) cw.L[(size_t) l].gu_e_stride);
-            k.push_back((unsigned long long) cw.L[(size_t) l].down_e_stride);
-        }
-        return k;
-    };
+    const auto shape_of = [&](int l) { return shape_key(m, l); };
     std::map<std::vector<unsigned long long>, std::vector<int>> cold;   // this shape's residents, coldest first
     for (int i : inside) cold[shape_of(i / NEXP)].push_back(i);
     for (auto& kv : cold)
@@ -1015,6 +1041,584 @@ void note_route_counts(Model& m, const unsigned* counts, size_t n)
         }
         std::fprintf(stderr, "fnx: l2: dyn: dry-run: first picks: %s\n", line.c_str());
     }
+}
+
+// M3-2's first real step (docs/m3_plan.md sec.9.10 / 9.11), behind FNX_L2_DYN=2 and called at the same pass boundary
+// as the dry-run above: make that re-lay happen. The hottest experts host RAM still holds take the arena rows of the
+// coldest residents, and each victim takes the newcomer's page-locked row in its place, so host RAM neither grows nor
+// shrinks and what M3-1 gave back stays given back. The order below is the whole safety argument:
+//   1. read the cards' live slot table first, so a victim that still holds a first-tier VRAM slot is known before
+//      anything is chosen - it keeps that slot's pointer and only its host entries come back (sec.9.9);
+//   2. park the victims in both pick maps: no new pick reaches their rows, and no byte or table has moved yet, so
+//      relayout() is that step's undo;
+//   3. wait for the tier to be genuinely idle, then synchronize both cards and the tier, so nothing is in flight over
+//      a row about to be overwritten;
+//   4. move the bytes - victim's row into page-locked scratch, newcomer's RAM into the row, and only once the RAM
+//      copies are gone (FNX_L2_DROP_HOST) the scratch back into the newcomer's RAM row, which is the row the victim
+//      gets in exchange. With that knob at 0 every victim still owns its own RAM copy, so no host table and no mirror
+//      moves at all and a re-lay cannot be told from the run that never had one;
+//   5. publish: the six card tables all-or-nothing (down, rebuilt, up), then the host mirrors, then at[], then
+//      relayout(). Anything that fails puts the bytes back the way they came and the tables back as they were read,
+//      and stops re-laying for the rest of the run rather than pointing a card at a weight it no longer owns.
+void relay_picks(Model& m, const unsigned* counts, size_t n)
+{
+    Ctx& c = shared();
+    if (dyn_mode() < 2) return;   // off, or step 0 watching: not one table read, not one byte moved
+    const size_t nidx = (size_t) NL * NEXP;
+    if (!c.ok || !c.arena || c.at.size() != nidx) return;
+    if (!counts || n != 2 * nidx) return;   // nothing to rank; the dry-run has already said so once
+    if (!dec::map(0) || !dec::map(1)) return;   // no decode tier for a card: its picks never went near the arena
+
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lock(mu);
+    static bool off_forever = false;   // one failed re-lay and this run never tries again
+    if (off_forever) return;
+    static std::map<std::string, bool> said;
+    const auto say = [&](const char* why) {
+        if (said.find(why) != said.end()) return;   // every pass boundary would otherwise repeat it
+        said[why] = true;
+        std::fprintf(stderr, "fnx: l2: dyn: swap: off: %s%c", why, 10);
+    };
+    static std::vector<unsigned long long> last;   // the tally as of the last re-lay that actually landed
+    static Seg* dseg = nullptr;                    // one segment at a time, for the tier's own fold
+    static unsigned long long* dfold = nullptr;
+    static char* stash = nullptr;                  // the victims' rows, page-locked, while the newcomers move in
+    static size_t stash_bytes = 0;
+
+    // ---- what is hot: the same difference the dry-run reads, but kept here only while a re-lay lands, so a pass that
+    //      was too small (or let the tier finish its round) does not silently throw its picks away
+    std::vector<unsigned long long> cum(nidx, 0), heat(nidx, 0);
+    for (size_t i = 0; i < nidx; ++i) cum[i] = (unsigned long long) counts[i] + (unsigned long long) counts[nidx + i];
+    const bool had = last.size() == nidx;
+    unsigned long long since = 0, covered = 0;
+    for (size_t i = 0; i < nidx; ++i) {
+        heat[i] = had && cum[i] >= last[i] ? cum[i] - last[i] : cum[i];
+        since += heat[i];
+        if (c.at[i] >= 0) covered += heat[i];
+    }
+    const unsigned long long floor_pick = dyn_min_picks() > 0 ? (unsigned long long) dyn_min_picks() : 0;
+    if (!since || since < floor_pick) return;   // a five-token ask is not worth re-laying over
+
+    // ---- the cards' live slot table, read this boundary: the decode cache (moe.cuh) moves slots between experts
+    //      while the engine runs, so the snapshot taken at load cannot say who holds one now (sec.9.9)
+    std::vector<std::vector<int>> slot((size_t) NCARD);
+    for (int t = 0; t < NCARD; ++t) {
+        const CardW& cw = m.cards[(size_t) t];
+        slot[(size_t) t].assign(nidx, -1);
+        if (!cw.ec.slot_of) {
+            say("a card has no first-tier slot table to read");
+            return;
+        }
+        OnDevice on_card(cw.dev);
+        if (!on_card.ok ||
+            cudaMemcpy(slot[(size_t) t].data(), cw.ec.slot_of, nidx * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            say("a card's live first-tier slot table would not come down");
+            return;
+        }
+    }
+    const auto holds_slot = [&](size_t i) {
+        for (int t = 0; t < NCARD; ++t)
+            if (slot[(size_t) t][i] < 0) return false;
+        return true;
+    };
+
+    // ---- how one expert of each layer is laid out, on every card and in the arena. A re-lay puts the newcomer's
+    //      bytes where the victim's row sits, so the two must be described alike: the pool's row (dn_off,
+    //      slot_bytes) and the host row's two strides must agree, and the arena row must be the cards' slices packed
+    //      in card order exactly the way setup() filled it (sec.9.8). Four numbers per card answer it.
+    struct Lay {
+        bool ok = false;
+        size_t need = 0;
+        size_t pre[(size_t) NCARD] = {};
+        size_t gs[(size_t) NCARD] = {};
+        size_t ds[(size_t) NCARD] = {};
+    };
+    std::vector<Lay> lay((size_t) NL);
+    for (int l = 0; l < NL; ++l) {
+        Lay ly;
+        bool bad = false;
+        for (int t = 0; t < NCARD; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            const int p = cw.ec.pool_of[l];
+            const size_t gs = cw.L[(size_t) l].gu_e_stride, ds = cw.L[(size_t) l].down_e_stride;
+            if (p < 0 || p >= EC_POOLS || gs == 0 || ds == 0 || cw.ec.dn_off[p] != gs || cw.ec.slot_bytes[p] != gs + ds) {
+                bad = true;
+                break;
+            }
+            ly.gs[(size_t) t] = gs;
+            ly.ds[(size_t) t] = ds;
+        }
+        if (bad) continue;
+        size_t acc = 0;
+        for (int t = 0; t < NCARD; ++t) {
+            ly.pre[(size_t) t] = acc;
+            acc += m.cards[(size_t) t].ec.slot_bytes[m.cards[(size_t) t].ec.pool_of[l]];
+        }
+        ly.need = acc;
+        ly.ok = acc > 0;
+        lay[(size_t) l] = ly;
+    }
+    const auto key_of = [&](int l) { return lay[(size_t) l].ok ? shape_key(m, l) : std::vector<unsigned long long>(); };
+
+    // ---- who may trade. A newcomer must sit outside the arena, have been picked this while, hold no first-tier slot
+    //      (its weights would then be the card's own, not this tier's to take) and still have a page-locked copy on
+    //      every card. A victim is any resident of the same shape, coldest first.
+    std::vector<int> inside, outside;
+    for (size_t i = 0; i < nidx; ++i) {
+        if (c.at[i] >= 0) {
+            inside.push_back((int) i);
+            continue;
+        }
+        if (!heat[i] || holds_slot(i)) continue;
+        bool ram = true;
+        for (int t = 0; t < NCARD; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            if (i >= cw.cpu_host_gu.size() || i >= cw.cpu_host_dn.size() || !cw.cpu_host_gu[i] || !cw.cpu_host_dn[i]) {
+                ram = false;
+                break;
+            }
+        }
+        if (ram) outside.push_back((int) i);
+    }
+    std::map<std::vector<unsigned long long>, std::vector<int>> cold;
+    for (int i : inside) cold[key_of(i / NEXP)].push_back(i);
+    for (auto& kv : cold) {
+        if (kv.first.empty()) {
+            kv.second.clear();   // a layer the shapes do not describe trades in neither direction
+            continue;
+        }
+        std::stable_sort(kv.second.begin(), kv.second.end(), [&](int a, int b) { return heat[a] < heat[b]; });
+    }
+    std::map<std::vector<unsigned long long>, size_t> used;
+    std::stable_sort(outside.begin(), outside.end(), [&](int a, int b) { return heat[a] > heat[b]; });
+
+    struct Pair {
+        int ni = 0, vi = 0;
+        size_t off = 0;
+        bool wrote = false;   // the newcomer's RAM row was overwritten, so an undo has to bring it back
+    };
+    const size_t ask = dyn_swap_n() > 0 ? (size_t) dyn_swap_n() : inside.size();
+    const bool verify = dyn_verify() != 0;
+    std::vector<Pair> picked;
+    size_t relay_bytes = 0, slot_victims = 0;
+    unsigned long long moved = 0;
+    for (int ni : outside) {
+        if (picked.size() >= ask) break;
+        const int l = ni / NEXP;
+        const Lay& ly = lay[(size_t) l];
+        if (!ly.ok || ly.need == 0) continue;
+        if (relay_bytes + ly.need > RELAY_STASH_MAX_BYTES) break;   // one re-lay's scratch stays bounded
+        const std::vector<unsigned long long> k = key_of(l);
+        if (k.empty()) continue;
+        const auto it = cold.find(k);
+        if (it == cold.end() || it->second.empty()) continue;
+        size_t& u = used[k];
+        if (u >= it->second.size()) continue;
+        const int vi = it->second[u];
+        // only a clear win: the newcomer has to be wanted at least twice as much as the victim, and wanted at all.
+        // The coldest of this shape failed, so the ones behind it are hotter and cannot pass either - stop here.
+        if (heat[(size_t) ni] < heat[(size_t) vi] * 2ULL || heat[(size_t) ni] < 4ULL) {
+            u = it->second.size();
+            continue;
+        }
+        ++u;
+        Pair pr;
+        pr.ni = ni;
+        pr.vi = vi;
+        pr.off = relay_bytes;
+        relay_bytes += ly.need;
+        picked.push_back(pr);
+        moved += heat[(size_t) ni];
+        if (holds_slot((size_t) vi)) ++slot_victims;
+    }
+    if (picked.empty()) return;   // nothing worth trading this pass: leave the tally where it is
+
+    // ---- stop the tier taking more picks for the victims' rows before anything else happens. park() moves nothing,
+    //      so relayout() puts the maps back if the steps after it have to be given up.
+    std::vector<int> victims(picked.size());
+    for (size_t k = 0; k < picked.size(); ++k) victims[k] = picked[k].vi;
+    if (!dec::park(victims.data(), victims.size())) {
+        (void) dec::relayout();
+        say("a pick map would not park the victims");
+        return;
+    }
+    if (!dec::quiescent()) {
+        // a round was already asked for; give its answer a moment, because its kernels read the rows chosen below
+        bool drained = false;
+        for (int attempt = 0; attempt < 25 && !drained; ++attempt) {
+            drained = dec::quiescent();
+            if (!drained) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!drained) {
+            (void) dec::relayout();
+            say("a round the tier had already taken did not answer before the re-lay ran out of patience");
+            return;
+        }
+    }
+    for (int t = 0; t < NCARD; ++t) {
+        OnDevice on_card(m.cards[(size_t) t].dev);
+        if (!on_card.ok || cudaDeviceSynchronize() != cudaSuccess) {
+            (void) dec::relayout();
+            say("a card would not come to rest for a re-lay");
+            return;
+        }
+    }
+    {
+        OnDevice on_tier(c.dev);
+        if (!on_tier.ok || cudaDeviceSynchronize() != cudaSuccess) {
+            (void) dec::relayout();
+            say("the tier would not come to rest for a re-lay");
+            return;
+        }
+    }
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
+    // how far the copies got. `filled` counts the pairs whose victim bytes really are sitting in the scratch - only
+    // those may be restored from it, because the rest of the scratch is still whatever it was when it was allocated.
+    // `done` counts the pairs whose trade finished end to end. Both are read only on the way out.
+    size_t filled = 0, done = 0;
+
+    // put back what the first `upto` pairs took: a newcomer's bytes are still in the row they moved into, and each
+    // victim's bytes are still in the scratch, so an undo is two copies per pair and no table guesswork. Forward order
+    // is right, since every pair owns a row of its own.
+    const auto undo_after = [&](size_t upto) {
+        if (!stash) return;
+        OnDevice on_undo(c.dev);
+        for (size_t k = 0; k < upto && k < filled && k < picked.size(); ++k) {
+            const Pair& pr = picked[k];
+            const Lay& ly = lay[(size_t)(pr.ni / NEXP)];
+            const char* row = c.arena + (size_t) c.at[(size_t) pr.vi];
+            if (pr.wrote) {
+                for (int t = 0; t < NCARD; ++t) {
+                    CardW& cw = m.cards[(size_t) t];
+                    const size_t gs = ly.gs[(size_t) t], ds = ly.ds[(size_t) t];
+                    std::memcpy((void*) cw.cpu_host_gu[(size_t) pr.ni], row + ly.pre[(size_t) t], gs);
+                    std::memcpy((void*) cw.cpu_host_dn[(size_t) pr.ni], row + ly.pre[(size_t) t] + gs, ds);
+                }
+            }
+            if (cudaMemcpy(c.arena + (size_t) c.at[(size_t) pr.vi], stash + pr.off, ly.need, cudaMemcpyHostToDevice) != cudaSuccess) return;
+        }
+    };
+
+    // ---- the tier's context for every byte below: its own memory on one side, the cards' page-locked rows on the
+    //      other, which is the pairing step 0 measured (both kinds of block, mapped and mapped|portable).
+    std::string fail;
+    {
+        OnDevice on_tier(c.dev);
+        if (!on_tier.ok) {
+            (void) dec::relayout();
+            say("the tier's context would not open for a re-lay");
+            return;
+        }
+        if (verify && !dseg && cudaMalloc((void**) &dseg, sizeof(Seg)) != cudaSuccess) dseg = nullptr;
+        if (verify && !dfold && cudaMalloc((void**) &dfold, 2 * sizeof(unsigned long long)) != cudaSuccess) dfold = nullptr;
+        if (verify && (!dseg || !dfold)) {
+            (void) dec::relayout();
+            say("no room on the tier to fold the bytes FNX_L2_DYN_VERIFY asked for");
+            return;
+        }
+        if (stash_bytes < relay_bytes) {
+            if (stash) {
+                cudaFreeHost(stash);
+                stash = nullptr;
+                stash_bytes = 0;
+            }
+            if (cudaHostAlloc((void**) &stash, relay_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) stash = nullptr;
+            if (!stash) {
+                (void) dec::relayout();
+                say("no page-locked scratch for the victims' rows");
+                return;
+            }
+            stash_bytes = relay_bytes;
+        }
+
+        // the newcomer's host rows, in the order the arena holds them: card 0's gate|up and down, then card 1's
+        const auto host_pieces = [&](int i, const Lay& ly, std::vector<Piece>& out) {
+            out.clear();
+            for (int t = 0; t < NCARD; ++t) {
+                const CardW& cw = m.cards[(size_t) t];
+                if ((size_t) i >= cw.cpu_host_gu.size() || (size_t) i >= cw.cpu_host_dn.size()) return false;
+                const char* g = cw.cpu_host_gu[(size_t) i];
+                const char* d = cw.cpu_host_dn[(size_t) i];
+                const size_t gs = ly.gs[(size_t) t], ds = ly.ds[(size_t) t];
+                if (!g || !d) return false;
+                if (d == g + gs) out.push_back({g, gs + ds});
+                else {
+                    out.push_back({g, gs});
+                    out.push_back({d, ds});
+                }
+            }
+            return !out.empty();
+        };
+        std::vector<unsigned long long> vsum(picked.size(), 0), vxor(picked.size(), 0);
+        for (size_t k = 0; k < picked.size() && fail.empty(); ++k) {
+            const Pair& pr = picked[k];
+            const Lay& ly = lay[(size_t)(pr.ni / NEXP)];
+            const char* row = c.arena + (size_t) c.at[(size_t) pr.vi];
+            if (verify) {
+                if (!arena_fold(c.arena, (unsigned long long)(row - c.arena), ly.need, dseg, dfold, vsum[k], vxor[k])) {
+                    fail = "the tier would not fold a victim's row before the copy";
+                    break;
+                }
+                if (!c.dropped) {
+                    std::vector<Piece> hp;
+                    if (!host_pieces(pr.vi, ly, hp)) {
+                        fail = "a victim's host rows are not there to check the arena against";
+                        break;
+                    }
+                    unsigned long long s2 = 0, x2 = 0;
+                    host_fold(hp, s2, x2);
+                    if (s2 != vsum[k] || x2 != vxor[k]) {
+                        fail = "a victim's arena row and its host copy disagree before a byte moved";
+                        break;
+                    }
+                }
+            }
+            // out of the way first: the newcomer's RAM row is about to hold the victim, so the victim needs a place
+            if (cudaMemcpy(stash + pr.off, row, ly.need, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                fail = "a victim's arena row would not come down into the scratch";
+                break;
+            }
+            ++filled;
+            // and the newcomer in, per card, at the offset that card's slice sits at inside the row
+            for (int t = 0; t < NCARD; ++t) {
+                const CardW& cw = m.cards[(size_t) t];
+                const size_t gs = ly.gs[(size_t) t], ds = ly.ds[(size_t) t];
+                const char* g = cw.cpu_host_gu[(size_t) pr.ni];
+                const char* d = cw.cpu_host_dn[(size_t) pr.ni];
+                char* dst = (char*) (row + ly.pre[(size_t) t]);
+                bool ok = d == g + gs ? cudaMemcpy(dst, g, gs + ds, cudaMemcpyHostToDevice) == cudaSuccess
+                                      : (cudaMemcpy(dst, g, gs, cudaMemcpyHostToDevice) == cudaSuccess &&
+                                         cudaMemcpy(dst + gs, d, ds, cudaMemcpyHostToDevice) == cudaSuccess);
+                if (!ok) {
+                    fail = "a newcomer's page-locked rows would not go up into the arena";
+                    break;
+                }
+            }
+            if (!fail.empty()) break;
+            if (verify) {
+                unsigned long long s1 = 0, x1 = 0;
+                std::vector<Piece> hp;
+                if (!arena_fold(c.arena, (unsigned long long)(row - c.arena), ly.need, dseg, dfold, s1, x1) || !host_pieces(pr.ni, ly, hp)) {
+                    fail = "the tier would not fold the row a newcomer moved into";
+                    break;
+                }
+                unsigned long long s2 = 0, x2 = 0;
+                host_fold(hp, s2, x2);
+                if (s1 != s2 || x1 != x2) {
+                    fail = "a newcomer's arena row is not the bytes its page-locked rows hold";
+                    break;
+                }
+            }
+            // the trade itself, and the only place host RAM is written: the victim takes over the row the newcomer
+            // leaves behind. With the RAM copies still in place (FNX_L2_DROP_HOST=0) there is nothing to hand over.
+            if (c.dropped) {
+                for (int t = 0; t < NCARD; ++t) {
+                    CardW& cw = m.cards[(size_t) t];
+                    const size_t gs = ly.gs[(size_t) t], ds = ly.ds[(size_t) t];
+                    const char* src = stash + pr.off + ly.pre[(size_t) t];
+                    std::memcpy((void*) cw.cpu_host_gu[(size_t) pr.ni], src, gs);
+                    std::memcpy((void*) cw.cpu_host_dn[(size_t) pr.ni], src + gs, ds);
+                }
+                picked[k].wrote = true;
+                if (verify) {
+                    std::vector<Piece> hp;
+                    if (!host_pieces(pr.ni, ly, hp)) {
+                        fail = "a victim's new host rows are not there to fold";
+                        break;
+                    }
+                    unsigned long long s2 = 0, x2 = 0;
+                    host_fold(hp, s2, x2);
+                    if (s2 != vsum[k] || x2 != vxor[k]) {
+                        fail = "the row a victim took over is not the bytes its arena row held";
+                        break;
+                    }
+                }
+            }
+            ++done;
+        }
+        if (!fail.empty()) {
+            undo_after(picked.size());
+            (void) dec::relayout();
+            say(fail.c_str());
+            off_forever = true;
+            return;
+        }
+    }
+
+    // ---- publish the six card tables. Down, rebuilt, up: the base address never changes, so model.cpp's cached
+    //      rows, every captured graph and both host mirrors keep reading the same arrays (sec.9.11). Only a run that
+    //      gave its RAM back has anything to hand over - with FNX_L2_DROP_HOST=0 the victims keep the copies they
+    //      already owned, so their rows and mirrors are already right and stay exactly as they are.
+    std::vector<std::vector<const char*>> g0((size_t) NCARD), d0((size_t) NCARD), h0((size_t) NCARD), k0((size_t) NCARD);
+    std::vector<std::vector<const char*>> g1((size_t) NCARD), d1((size_t) NCARD), h1((size_t) NCARD), k1((size_t) NCARD);
+    const auto tbl = [&](int t, int w) -> const char** {
+        const CardW& cw = m.cards[(size_t) t];
+        switch (w) {
+            case 0: return (const char**) cw.ec.ep_gu;
+            case 1: return (const char**) cw.ec.ep_dn;
+            case 2: return (const char**) cw.ec.host_gu;
+            default: return (const char**) cw.ec.host_dn;
+        }
+    };
+    size_t pushed_cards = 0;
+    if (c.dropped) {
+        bool bad = false;
+        for (int t = 0; t < NCARD && !bad; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            OnDevice on_card(cw.dev);
+            if (!on_card.ok) {
+                bad = true;
+                break;
+            }
+            for (int w = 0; w < 4; ++w) {
+                std::vector<const char*>& dst = w == 0 ? g0[(size_t) t] : w == 1 ? d0[(size_t) t] : w == 2 ? h0[(size_t) t] : k0[(size_t) t];
+                dst.assign(nidx, nullptr);
+                if (cudaMemcpy(dst.data(), (void*) tbl(t, w), nidx * sizeof(void*), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    bad = true;
+                    break;
+                }
+            }
+        }
+        if (bad) {
+            undo_after(picked.size());
+            (void) dec::relayout();
+            say("a card's expert tables would not come down for the re-lay");
+            off_forever = true;
+            return;
+        }
+        // and the slots once more, immediately before the rows are written: a decode round may have moved one while
+        // the bytes were crossing, and sec.9.9 turns on exactly that number
+        for (int t = 0; t < NCARD && !bad; ++t) {
+            const CardW& cw = m.cards[(size_t) t];
+            std::vector<int> fresh(nidx, -1);
+            OnDevice on_card(cw.dev);
+            if (!on_card.ok || cudaMemcpy(fresh.data(), cw.ec.slot_of, nidx * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                bad = true;
+                break;
+            }
+            slot[(size_t) t].swap(fresh);
+        }
+        if (bad) {
+            undo_after(picked.size());
+            (void) dec::relayout();
+            say("a card's first-tier slots moved while the bytes were crossing");
+            off_forever = true;
+            return;
+        }
+        for (int t = 0; t < NCARD && !bad; ++t) {
+            g1[(size_t) t] = g0[(size_t) t];
+            d1[(size_t) t] = d0[(size_t) t];
+            h1[(size_t) t] = h0[(size_t) t];
+            k1[(size_t) t] = k0[(size_t) t];
+            for (const Pair& pr : picked) {
+                const size_t ip = (size_t) pr.ni, iv = (size_t) pr.vi;
+                const char* mg = h0[(size_t) t][ip];
+                const char* md = k0[(size_t) t][ip];
+                if (!mg || !md) {   // the newcomer's RAM row went missing mid-pass: trade nothing for this card
+                    bad = true;
+                    break;
+                }
+                h1[(size_t) t][iv] = mg;
+                k1[(size_t) t][iv] = md;
+                // sec.9.9: a victim that holds a first-tier slot keeps that slot's expert pointer, because the slot -
+                // not the RAM row - is what its cards read now. Only one without a slot follows the copy.
+                if (slot[(size_t) t][iv] < 0) {
+                    g1[(size_t) t][iv] = mg;
+                    d1[(size_t) t][iv] = md;
+                }
+                h1[(size_t) t][ip] = nullptr;
+                k1[(size_t) t][ip] = nullptr;
+                if (slot[(size_t) t][ip] < 0) {
+                    g1[(size_t) t][ip] = nullptr;
+                    d1[(size_t) t][ip] = nullptr;
+                }
+            }
+        }
+        if (bad) {
+            undo_after(picked.size());
+            (void) dec::relayout();
+            say("a re-lay's new table rows could not be built");
+            off_forever = true;
+            return;
+        }
+        // up, and only once every card's rows are ready: a half-published card would answer a pick from a row its
+        // mirror does not point at. A card that refused goes back to exactly what was read a moment ago.
+        bool up_bad = false;
+        for (int t = 0; t < NCARD && !up_bad; ++t) {
+            CardW& cw = m.cards[(size_t) t];
+            OnDevice on_card(cw.dev);
+            if (!on_card.ok) {
+                up_bad = true;
+                break;
+            }
+            bool ok = true;
+            for (int w = 0; w < 4 && ok; ++w) {
+                const std::vector<const char*>& src = w == 0 ? g1[(size_t) t] : w == 1 ? d1[(size_t) t] : w == 2 ? h1[(size_t) t] : k1[(size_t) t];
+                ok = cudaMemcpy((void*) tbl(t, w), src.data(), nidx * sizeof(void*), cudaMemcpyHostToDevice) == cudaSuccess;
+            }
+            if (!ok) up_bad = true;
+            if (!up_bad) ++pushed_cards;
+        }
+        if (up_bad) {
+            for (int t = 0; t <= (int) pushed_cards && t < NCARD; ++t) {
+                CardW& cw = m.cards[(size_t) t];
+                OnDevice on_card(cw.dev);
+                if (!on_card.ok) continue;
+                for (int w = 0; w < 4; ++w) {
+                    const std::vector<const char*>& src = w == 0 ? g0[(size_t) t] : w == 1 ? d0[(size_t) t] : w == 2 ? h0[(size_t) t] : k0[(size_t) t];
+                    (void) cudaMemcpy((void*) tbl(t, w), src.data(), nidx * sizeof(void*), cudaMemcpyHostToDevice);
+                }
+            }
+            undo_after(picked.size());
+            (void) dec::relayout();
+            say("a card would not take the re-lay's new table rows");
+            off_forever = true;
+            return;
+        }
+        // every card reads the new rows on both sides now, so the host mirrors may follow them (the same four names
+        // drop_host() republished, in the same order: the victim first, then the newcomer's side going null)
+        for (int t = 0; t < NCARD; ++t) {
+            CardW& cw = m.cards[(size_t) t];
+            for (const Pair& pr : picked) {
+                const size_t ip = (size_t) pr.ni, iv = (size_t) pr.vi;
+                cw.ec_host_gu[iv] = h0[(size_t) t][ip];
+                cw.ec_host_dn[iv] = k0[(size_t) t][ip];
+                cw.ec_host_gu[ip] = nullptr;
+                cw.ec_host_dn[ip] = nullptr;
+                cw.cpu_host_gu[iv] = cw.cpu_host_gu[ip];
+                cw.cpu_host_dn[iv] = cw.cpu_host_dn[ip];
+                cw.cpu_host_gu[ip] = nullptr;
+                cw.cpu_host_dn[ip] = nullptr;
+            }
+        }
+    }
+
+    // ---- and the tier's own map of it: the same 1-for-1, one row moving from one entry to the other. `experts` and
+    //      `dropped_experts` keep their startup values on purpose - a re-lay trades an entry for an entry, so neither
+    //      count moves and the startup log stays what it said.
+    for (size_t k = 0; k < picked.size(); ++k) {
+        const size_t ip = (size_t) picked[k].ni, iv = (size_t) picked[k].vi;
+        const long long row = c.at[iv];
+        c.at[ip] = row;
+        c.at[iv] = -1;
+        if (c.dropped_entry.size() == nidx) {
+            c.dropped_entry[ip] = c.dropped ? 1 : 0;
+            c.dropped_entry[iv] = 0;
+        }
+    }
+    if (!dec::relayout()) {
+        say("the tables over the moved rows would not go back up");
+        off_forever = true;
+        return;
+    }
+
+    std::fprintf(stderr,
+                 "fnx: l2: dyn: swap: %zu pairs (%zu with a first-tier slot) in %.1f ms, +%llu picks est (%.1f%% -> "
+                 "%.1f%%), verify=%s\n",
+                 picked.size(), slot_victims, seconds_since(t0) * 1000.0, moved, 100.0 * (double) covered / (double) since,
+                 100.0 * (double) (covered + moved) / (double) since, verify ? "ok" : "off");
+    last = cum;
 }
 
 }  // namespace l2

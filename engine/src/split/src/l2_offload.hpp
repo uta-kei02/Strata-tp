@@ -31,10 +31,11 @@ inline long long promote_thresh() { return env_int("FNX_L2_PROMOTE_THRESH", 3); 
 inline long long demote_thresh() { return env_int("FNX_L1_DEMOTE_THRESH", 0); }
 
 // M3-2 (docs/m3_plan.md sec.9): the arena stops being a fixed set and becomes a dynamic first-tier cache. The steps
-// are measured before they move anything, so 1 is step 0 (read-only probes plus the dry-run of one pass's picks) and
-// 2 and above are the re-lay itself, which is not implemented yet. 0 means none of it runs: at[], the cards' expert
-// tables and both cards' tier maps keep what startup wrote, exactly as rev.15-M3-1b. A value that is not a number is
-// off too - a measurement knob must never be the reason a working server stops.
+// are measured before they move anything, so 1 is step 0 (read-only probes plus the dry-run of one pass's picks), 2
+// is step 1 - the re-lay itself at a pass boundary, 1-for-1 - and 3 and above are left for the decode-side triggers.
+// 0 means none of it runs: at[], the cards' expert tables and both cards' tier maps keep what startup wrote, exactly
+// as rev.15-M3-1b. A value that is not a number is off too - a measurement knob must never be the reason a working
+// server stops.
 inline long long dyn_mode() {
     try {
         return env_int("FNX_L2_DYN", 0);
@@ -43,10 +44,34 @@ inline long long dyn_mode() {
     }
 }
 
-// how many experts one re-lay may move; what step 0's dry-run sizes itself with. 0 = as many as the arena holds now
+// how many experts one re-lay may move, and what step 0's dry-run sizes itself with. A re-lay moves pairs, so this is
+// pairs per boundary: 64 pairs of this model is 141 MiB each way, which at the pinned speed step 0 measured is a
+// hundredth of a second. 0 means as many as the arena holds now, which nobody wants while a server is answering.
 inline long long dyn_swap_n() {
     try {
-        return env_int("FNX_L2_DYN_N", 0);
+        return env_int("FNX_L2_DYN_N", 64);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// the floor a re-lay will work for: fewer picks than this since the last look and the boundary is a five-token
+// question, where every ranking is noise and moving weights would be pure thrash (docs/m3_plan.md sec.9.11). The
+// default is the order of magnitude of one long prompt's picks, so a run of short asks never re-lays at all.
+inline long long dyn_min_picks() {
+    try {
+        return env_int("FNX_L2_DYN_MIN_PICKS", 16384);
+    } catch (const std::exception&) {
+        return 0;
+    }
+}
+
+// check the bytes: fold every victim's arena row before the copy and its newcomer's RAM row after, fold the other way
+// round too, and stop the re-lay for the rest of the run if one byte disagrees. Two kernel launches a boundary, so it
+// is a measuring knob and off by default.
+inline long long dyn_verify() {
+    try {
+        return env_int("FNX_L2_DYN_VERIFY", 0);
     } catch (const std::exception&) {
         return 0;
     }
@@ -143,6 +168,16 @@ void probe_pinned(Model& m, int kind);
 // pass's hottest experts outside the arena with its coldest residents and prints what a 1-for-1 re-lay would have
 // covered. No weight, no at[], no expert table and no tier map moves, so the answers of the run do not change.
 void note_route_counts(Model& m, const unsigned* counts, size_t n);
+
+// M3-2 step 1 (docs/m3_plan.md sec.9.10 / 9.11), behind FNX_L2_DYN=2 and called at the same pass boundary as the
+// dry-run above: make that re-lay real. The hottest experts host RAM still holds take the arena rows of the coldest
+// residents, and every victim takes the newcomer's page-locked row in its place, so host RAM neither grows nor
+// shrinks and what M3-1 gave back stays given back (sec.9.8). Not one byte moves while anything is in flight: both
+// tier maps park the victims first, both cards and the tier are synchronized, and the tier's decode worker is idle.
+// A newcomer that also holds a first-tier VRAM slot keeps that slot's pointer, and so does a victim that does -
+// sec.9.9's rule, the one place a re-lay could otherwise point a card at a weight it no longer owns. With the knob
+// below 2 nothing here runs, so at[], the six card tables and both maps are exactly what startup wrote.
+void relay_picks(Model& m, const unsigned* counts, size_t n);
 
 }  // namespace l2
 }  // namespace fnx

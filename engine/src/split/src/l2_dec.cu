@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -43,6 +44,7 @@ struct Card {
     DW gu_e[NL];                      // the card's own expert matrices, copied so a launch needs no Model
     DW dn_e[NL];
     size_t gu_stride[NL] = {}, dn_stride[NL] = {};
+    size_t gs[NL] = {}, pre[NL] = {};    // open()'s per-layer numbers, kept so relayout() needs no Model
     unsigned long long last = 0;      // the last req_seq this card's round was answered
     long hits = 0, rows = 0, reqs = 0, shown = 0;   // shown: how many of this card's rounds the trace has printed
     double ms = 0;
@@ -56,6 +58,7 @@ struct S {
     int dev = -1;
     int ffs = 0;
     int cap = ROWS;
+    bool relay = false;               // FNX_L2_DYN >= 2: track busy, because a re-lay may not cross a round
     bool stats = false;
     bool trace = false;               // FNX_L2_DEC_TRACE: the rounds around a failure, so the log says which layer it died in
     int stage = 0;                    // FNX_L2_DEC_STAGE: which of those rounds' steps to print (1 lists, 2 upload, 4 kernels, 8 answer copy, 16 counter)
@@ -67,6 +70,7 @@ struct S {
     float* part = nullptr;            // tier: [ROWS][N]
     Card card[NCARD];
     tpopt::WaitSlot wake;
+    std::atomic<bool> busy{false};    // the worker is inside one card's round; a re-lay waits for this to drop
 };
 
 S& s() {
@@ -264,12 +268,14 @@ void worker() {
             if (cur == g.card[t].last) continue;
             g.card[t].last = cur;
             std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (g.relay) g.busy.store(true, std::memory_order_seq_cst);
             if (g.dead) {
                 zero_rows(g.card[t]);
                 answer(g.card[t], cur);
             } else {
                 run(t, cur);
             }
+            if (g.relay) g.busy.store(false, std::memory_order_seq_cst);
             any = true;
         }
         if (any) {
@@ -321,6 +327,7 @@ bool open(int card, Model& m, CpuMoeBox* hbox) {
         g.stats = env_flag("FNX_L2_DEC_STATS");
         g.trace = env_flag("FNX_L2_DEC_TRACE");
         g.stage = (int) env_int("FNX_L2_DEC_STAGE", 0);
+        g.relay = l2::dyn_mode() >= 2;   // step 1 may move arena rows: the worker starts marking its rounds
         DevGuard on_tier(g.dev);   // everything below is the tier's memory, until a card's map says otherwise
         bool bad = !on_tier.ok;
         if (!bad && cudaStreamCreateWithFlags(&g.st, cudaStreamNonBlocking) != cudaSuccess) bad = true;
@@ -359,6 +366,8 @@ bool open(int card, Model& m, CpuMoeBox* hbox) {
                     const CardW& ow = m.cards[(size_t) u];
                     pre += ow.ec.slot_bytes[ow.ec.pool_of[l]];
                 }
+                g.card[t].gs[l] = gs;   // relayout() rebuilds these same two numbers without the Model in reach
+                g.card[t].pre[l] = pre;
                 for (int e = 0; e < NEXP; ++e) {
                     const size_t i = (size_t) l * NEXP + e;
                     if (lc.at[i] < 0) continue;
@@ -427,6 +436,111 @@ bool open(int card, Model& m, CpuMoeBox* hbox) {
         std::thread(worker).detach();
     }
     return true;
+}
+
+bool quiescent() {
+    S& g = s();
+    if (!g.on || g.dead || !g.started) return false;   // no worker to be idle: a re-lay would move rows nobody read
+    if (g.relay && g.busy.load(std::memory_order_acquire)) return false;
+    for (int t = 0; t < NCARD; ++t) {
+        const Card& cd = g.card[t];
+        if (!cd.box) continue;
+        // the two counters are the worker's own "asked / answered" pair. While they differ, a round is either still
+        // running on the tier or has not been picked up yet, and either way its kernels may read the rows a re-lay
+        // is about to overwrite. Both are written by other threads, so read them the way the worker reads them.
+        const unsigned long long asked = *(volatile const unsigned long long*) &cd.box->l2_req_seq;
+        const unsigned long long done = *(volatile const unsigned long long*) &cd.box->l2_done_seq;
+        if (asked != done) return false;
+    }
+    return true;
+}
+
+bool park(const int* idx, size_t n) {
+    S& g = s();
+    if (!g.on || g.dead) return false;
+    if (!idx || n == 0) return true;
+    std::vector<char> ht((size_t) NL * NEXP, 0);
+    for (int t = 0; t < NCARD; ++t) {
+        Card& cd = g.card[t];
+        if (!cd.map) continue;
+        DevGuard on_card(cd.dev);
+        if (!on_card.ok || cudaMemcpy(ht.data(), (void*) cd.map, (size_t) NL * NEXP, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            std::fprintf(stderr, "fnx: l2: dyn: swap: off: card %d's pick map would not come down%c", cd.dev, 10);
+            return false;
+        }
+        for (size_t k = 0; k < n; ++k)
+            if (idx[k] >= 0 && (size_t) idx[k] < (size_t) NL * NEXP) ht[(size_t) idx[k]] = 0;
+        if (cudaMemcpy(cd.map, ht.data(), (size_t) NL * NEXP, cudaMemcpyHostToDevice) != cudaSuccess) {
+            std::fprintf(stderr, "fnx: l2: dyn: swap: off: card %d's parked pick map would not go back up%c", cd.dev, 10);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool relayout() {
+    S& g = s();
+    if (!g.on || g.dead) return false;
+    const l2::Ctx& lc = l2::ctx();
+    const size_t nidx = (size_t) NL * NEXP;
+    if (!lc.ok || lc.arena == nullptr || lc.at.size() != nidx) return false;
+    std::vector<const char*> ht_gu(nidx), ht_dn(nidx);
+    std::vector<char> ht(nidx, 0);
+    DevGuard on_tier(g.dev);
+    if (!on_tier.ok) return false;
+    bool bad = false;
+    // each card's two tables, from the same two numbers open() used: this card's gate|up sits at the bytes of the
+    // cards before it and its down starts at the pool's dn_off. at[] is the only thing that changed, so rebuilding
+    // the whole table is both the simplest and the least error-prone way to publish a re-lay.
+    for (int t = 0; t < NCARD && !bad; ++t) {
+        Card& cd = g.card[t];
+        if (!cd.ep_gu || !cd.ep_dn) continue;
+        for (size_t i = 0; i < nidx; ++i) {
+            ht_gu[i] = nullptr;
+            ht_dn[i] = nullptr;
+        }
+        for (int l = 0; l < NL; ++l) {
+            const size_t gs = cd.gs[l], pre = cd.pre[l];
+            for (int e = 0; e < NEXP; ++e) {
+                const size_t i = (size_t) l * NEXP + e;
+                if (lc.at[i] < 0) continue;
+                ht_gu[i] = lc.arena + (size_t) lc.at[i] + pre;
+                ht_dn[i] = ht_gu[i] + gs;
+            }
+        }
+        // the same bounds check open() does at startup, here at every re-lay: an arena offset that belonged to a
+        // different layout would come back as an illegal access on a card a layer later, which is how Xid 31 starts
+        for (size_t i = 0; i < nidx && !bad; ++i) {
+            for (int q = 0; q < 2; ++q) {
+                const char* p = q ? ht_dn[i] : ht_gu[i];
+                if (!p) continue;
+                if (p < lc.arena || p >= lc.arena + lc.bytes) {
+                    std::fprintf(stderr,
+                                 "fnx: l2: dyn: swap: off: card %d layer %zu expert %zu's %s pointer %p is outside the "
+                                 "arena [%p, %p)%c",
+                                 cd.dev, i / NEXP, i % NEXP, q ? "down" : "gate|up", (const void*) p,
+                                 (const void*) lc.arena, (const void*) (lc.arena + lc.bytes), 10);
+                    bad = true;
+                }
+            }
+        }
+        for (int q = 0; q < 2 && !bad; ++q) {
+            const char** src = q ? ht_dn.data() : ht_gu.data();
+            char** dst = q ? (char**) cd.ep_dn : (char**) cd.ep_gu;
+            if (cudaMemcpy(dst, src, nidx * sizeof(char*), cudaMemcpyHostToDevice) != cudaSuccess) bad = true;
+        }
+    }
+    if (bad) return false;
+    // the maps go up last, and whole: relayout() is also the undo of park(), so an entry at[] still covers comes
+    // back to 1 here. A card that starts sending picks to an expert always finds its row already in the table.
+    for (size_t i = 0; i < nidx; ++i) ht[i] = lc.at[i] >= 0 ? 1 : 0;
+    for (int t = 0; t < NCARD && !bad; ++t) {
+        Card& cd = g.card[t];
+        if (!cd.map) continue;
+        DevGuard on_card(cd.dev);
+        if (!on_card.ok || cudaMemcpy(cd.map, ht.data(), nidx, cudaMemcpyHostToDevice) != cudaSuccess) bad = true;
+    }
+    return !bad;
 }
 
 const char* map(int card) { return card >= 0 && card < NCARD ? s().card[card].map : nullptr; }

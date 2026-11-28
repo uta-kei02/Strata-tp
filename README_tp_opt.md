@@ -61,8 +61,10 @@ Prefill の現最速は M2c-arch の **1,410.3 tok/s** で、次の **1,500 tok/
 | Decode の L1/L2/L3 内訳（件数と host worker・5070 の ms、3 行/サンプル） | `FNX_DEC_STATS` | 0（off は分岐 1 回のみ） |
 | 1 サンプルにまとめる window 数 | `FNX_DEC_STATS_EVERY` | 2048 |
 | 5070 arena 常駐 expert の host 原本をロード後に返却（M3-1） | `FNX_L2_DROP_HOST` | 0（1 は arena + `FNX_L2_PF` + `FNX_L2_DEC` + 両 card の表が揃うときだけ発火。揃わなければ警告して off。2 は 1軍 swap slot を持つ arena 常駐分も返す） |
-| 5070 の動的入替の前調査（host pinned 実測 + route 回数の dry-run。M3-2 Step 0） | `FNX_L2_DYN` | 0（off は分岐 1 回のみ。1 は重み・表・地図を動かさない試算だけ） |
-| dry-run 試算に入れる入れ替え個数 N | `FNX_L2_DYN_N` | 0 = 常駐数を上限に試算 |
+| 5070 アレーナの動的入替（M3-2） | `FNX_L2_DYN` | 0（off は分岐 1 回のみ。1 = host pinned 実測と route 回数の dry-run 試算だけ。2 = pass 境界で 1-for-1 の実入れ替え） |
+| 1 境界あたりの入れ替えペア数の上限 N | `FNX_L2_DYN_N` | 64（0 = 上限なし） |
+| 入れ替えを見送る picks 数（短文のスラッシング防止） | `FNX_L2_DYN_MIN_PICKS` | 16384 |
+| 動いた行の check-sum 照合（不一致は安全停止） | `FNX_L2_DYN_VERIFY` | 0 |
 | chunked GDN（sub-chunk 幅は card の opt-in 共有メモリから自動選択） | `FNX_PF_GDN_CHUNK` / `FNX_GDN_FORCE_REC` | 1（sm_75 は 16 列 = 57,988 B）/ 0 |
 | GDN 数値比較・時間計測 | `FNX_PF_GDN_CHECK` / `FNX_GDN_TIME` | 0 |
 | Prefill 失敗時の診断印字 | `FNX_PF_ERRDBG` | 0 |
